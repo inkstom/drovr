@@ -420,6 +420,12 @@ async fn archive_finished() -> Res<usize> {
     blocking(|e| e.archive_finished()).await
 }
 
+/// Continue an agent's session in your own terminal (terminal.external).
+#[tauri::command]
+async fn open_in_terminal(name: String) -> Res<drovr_core::engine::Opened> {
+    blocking(move |e| e.open_in_terminal(&name)).await
+}
+
 // -- inbox --------------------------------------------------------------------
 
 #[tauri::command]
@@ -938,6 +944,7 @@ pub fn run() {
             remove_group,
             attach_command,
             open_in_herdr,
+            open_in_terminal,
             archive_agent,
             unarchive_agent,
             archive_finished,

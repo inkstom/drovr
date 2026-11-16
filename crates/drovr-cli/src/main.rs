@@ -31,6 +31,7 @@ usage:
   drovr attach <agent>                       print the command to open its session interactively
   drovr msgs [group]                         the message bus
   drovr ask <question...>                    ask an agent with your MCPs (Slack, Jira, …)
+  drovr term <agent>                         continue an agent's session in your terminal (terminal.external)
   drovr archive <agent> | archive done       put an agent away (keeping its output), or every finished one
   drovr config                               where drovr reads its config and keeps its data
   drovr remote [--test]                      the phone page's sign-in link and QR code;
@@ -266,6 +267,15 @@ fn run() -> Result<()> {
                 "{}",
                 Sources::with_progress(&engine.cfg, &progress).ask(&rest(&args, 1), None)?
             );
+        }
+        "term" => {
+            let name = arg(&args, 1, "agent")?;
+            match engine.open_in_terminal(name)? {
+                drovr_core::engine::Opened::Pane(pane) => {
+                    println!("{name} is still running in herdr pane {pane}; showed it there")
+                }
+                drovr_core::engine::Opened::Terminal(script) => println!("{script}"),
+            }
         }
         "archive" => match arg(&args, 1, "agent name, or done")? {
             "done" => println!("archived {}", engine.archive_finished()?),

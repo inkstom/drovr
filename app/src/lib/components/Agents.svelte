@@ -200,14 +200,26 @@
     if (app.selected === name) app.selected = app.snap.agents[0]?.name ?? "";
   }
 
-  async function attach() {
+  async function openInHerdr() {
     if (!current) return;
-    if (app.snap.herdr) {
-      await act(() => api.openInHerdr(current.name), `Opened ${current.name} in herdr`);
-    } else {
+    await act(() => api.openInHerdr(current.name), `Opened ${current.name} in herdr`);
+  }
+
+  async function openInTerminal() {
+    if (!current) return;
+    const name = current.name;
+    const r = await act(() => api.openInTerminal(name));
+    if (r) toast(r.pane ? `${name} is still running in herdr pane ${r.pane}; showed it there` : `Opened ${name} in your terminal`);
+  }
+
+  async function copyAttach() {
+    if (!current) return;
+    try {
       const cmd = await api.attachCommand(current.name);
       await navigator.clipboard.writeText(cmd);
-      toast("Copied a command to open this session in your terminal");
+      toast("Copied a command that continues this session in any terminal");
+    } catch (e) {
+      toast(String(e));
     }
   }
 
@@ -264,7 +276,7 @@
     {#if interrupted.length}
       <div class="interrupted">
         <span class="grow">{interrupted.length} agent{interrupted.length > 1 ? "s were" : " was"} interrupted by a restart</span>
-        <button onclick={resumeAll}>Resume all</button>
+        <button onclick={resumeAll} title="Resume every interrupted agent where it left off">Resume all</button>
       </div>
     {/if}
     <div class="scroll grow">
@@ -329,16 +341,20 @@
           <h2 class="grow">{current.name}</h2>
           <span class="pill s-{current.state}">{current.state}</span>
           {#if current.state === "working"}
-            <button class="danger" onclick={() => act(() => api.stop(current.name), "Stopped")}>Stop</button>
+            <button class="danger" onclick={() => act(() => api.stop(current.name), "Stopped")} title="Stop its current run. Its session is kept, so you can resume it.">Stop</button>
           {:else if current.state === "stopped" || current.state === "error" || current.state === "interrupted"}
-            <button onclick={() => act(() => api.resume(current.name), "Resumed")}>Resume</button>
+            <button onclick={() => act(() => api.resume(current.name), "Resumed")} title="Start a new run that continues where it left off">Resume</button>
           {/if}
-          <button onclick={attach} title="Open this session interactively">{app.snap.herdr ? "Open in herdr" : "Copy attach cmd"}</button>
-          <button onclick={() => { app.view = "review"; }}>Review</button>
+          <button onclick={openInTerminal} title="Continue this agent's conversation in your own terminal (terminal.external). Stop it first if it's working.">Open in terminal</button>
+          {#if app.snap.herdr}
+            <button onclick={openInHerdr} title="Continue this agent's conversation in a new herdr pane, or show the pane it's already running in">Open in herdr</button>
+          {/if}
+          <button class="ghost" onclick={copyAttach} title="Copy a command that continues this conversation in any terminal">Copy cmd</button>
+          <button onclick={() => { app.view = "review"; }} title="See what this agent changed in each repo it worked in">Review</button>
           {#if currentTickets.length}
             <button onclick={() => (app.timeline = currentTickets[0])} title={`Everything that happened on ${currentTickets.join(", ")}, for review and the retro`}>Timeline</button>
           {/if}
-          <button class:on={app.termOpen} onclick={() => (app.termOpen = !app.termOpen)} title="Show or hide the terminal (⌃`)">Terminal</button>
+          <button class:on={app.termOpen} onclick={() => (app.termOpen = !app.termOpen)} title="Show or hide the terminal panel in the agent's folder (⌃`)">Terminal</button>
           {#if isArchived(current.name)}
             <button class="ghost" onclick={() => act(() => api.unarchiveAgent(current!.name), "Back in the list")} title="Put it back in the agent list">Unarchive</button>
           {:else}
@@ -357,7 +373,7 @@
           <span>updated {ago(current.updated)} ago</span>
         </div>
         {#if pending.length}
-          <button class="needs" onclick={() => (app.view = "inbox")}>⚑ {pending.length} item{pending.length > 1 ? "s" : ""} waiting for you in the Inbox</button>
+          <button title="Go to the Inbox to answer what this agent is waiting on" class="needs" onclick={() => (app.view = "inbox")}>⚑ {pending.length} item{pending.length > 1 ? "s" : ""} waiting for you in the Inbox</button>
         {/if}
       </header>
 
@@ -403,7 +419,7 @@
       <footer>
         <textarea rows="3" bind:value={input} onkeydown={onKey}
           placeholder={current.state === "working" ? "It's busy, so this is queued until its run ends. Enter sends, Shift+Enter for a new line" : "Prompt this agent. Enter sends, Shift+Enter for a new line"}></textarea>
-        <button class="primary" onclick={send} disabled={!input.trim()}>Send</button>
+        <button title="Send this message to the agent (Enter). If it's working, it's queued until the run ends." class="primary" onclick={send} disabled={!input.trim()}>Send</button>
       </footer>
       {#if app.termOpen}<TerminalPanel agent={current} />{/if}
     {:else}
@@ -462,6 +478,5 @@
   footer { display: flex; gap: 8px; padding: 10px 16px; border-top: 1px solid var(--border); align-items: flex-end; }
   .cost { color: var(--yellow); border-color: var(--yellow); }
   .stage { color: var(--green); border-color: var(--green); }
-  button.on { border-color: var(--accent); color: var(--accent); }
   button.armed, button.armed:hover { background: var(--red); color: #fff; border-color: var(--red); opacity: 1; }
 </style>

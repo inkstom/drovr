@@ -118,6 +118,8 @@ export const api = {
   removeGroup: (group: string) => invoke<string>("remove_group", { group }),
   attachCommand: (name: string) => invoke<string>("attach_command", { name }),
   openInHerdr: (name: string) => invoke<string>("open_in_herdr", { name }),
+  /** `pane` when it's still live in herdr (shown there), `terminal` (its script) when a terminal opened. */
+  openInTerminal: (name: string) => invoke<{ pane?: string; terminal?: string }>("open_in_terminal", { name }),
   archiveAgent: (name: string) => invoke<void>("archive_agent", { name }),
   unarchiveAgent: (name: string) => invoke<void>("unarchive_agent", { name }),
   archiveFinished: () => invoke<number>("archive_finished"),

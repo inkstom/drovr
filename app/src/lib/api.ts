@@ -123,6 +123,7 @@ export const api = {
   archiveAgent: (name: string) => invoke<void>("archive_agent", { name }),
   unarchiveAgent: (name: string) => invoke<void>("unarchive_agent", { name }),
   archiveFinished: () => invoke<number>("archive_finished"),
+  clearResolved: () => invoke<void>("clear_resolved"),
   answer: (id: number, answer: string) => invoke<void>("inbox_answer", { id, answer }),
   reject: (id: number, reason: string) => invoke<void>("inbox_reject", { id, reason }),
   termWorkspace: (name: string) => invoke<string>("term_workspace", { name }),

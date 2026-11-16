@@ -155,6 +155,7 @@ drovr msgs pay-api
 - **Code review** (⌘7): pick an agent to see each repo and worktree it worked in, with what changed on its branch (committed or not) and the diffs. It works when the agent started in a folder above your repos. Send feedback about a file. If your plans folder is in a git repo (say `~/.claude`), only the part this agent worked in is shown there.
 - **Agents:** each agent's full output, tool calls and cost. **Open in terminal** continues its conversation in your own terminal (`terminal.external`); **Open in herdr** opens it in a herdr pane, or focuses its pane if it's already running there; **Copy cmd** copies the command for any terminal. **Archive** takes a finished agent out of the list (**Archive done** does every finished one, **Archived** shows them), keeping its output.
 - **Hover descriptions:** rest the pointer on any button or menu item to see what it does.
+- **Inbox history:** **show resolved** lists what you've answered; **Clear** hides everything resolved so far. Nothing is deleted.
 - **Timeline:** with `workflow.enabled`, everything that happened on a ticket (see [Read a ticket's timeline](#read-a-tickets-timeline)).
 
 ```sh

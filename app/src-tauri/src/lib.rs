@@ -46,6 +46,8 @@ struct AgentView {
 #[derive(Serialize)]
 struct Snapshot {
     agents: Vec<AgentView>,
+    /// Agents you've archived; the list hides them unless you ask.
+    archived: Vec<String>,
     groups: Vec<Group>,
     inbox: Vec<Item>,
     recent: Vec<Item>,
@@ -69,16 +71,12 @@ async fn snapshot() -> Res<Snapshot> {
                 agent: a,
             })
             .collect();
-        let recent = e
-            .store
-            .items(None, 60)?
-            .into_iter()
-            .filter(|i| i.status != "pending")
-            .rev()
-            .take(30)
-            .collect();
+        // Clear in the Inbox hides what was resolved before it.
+        let cleared: f64 = e.store.pref("inbox_cleared")?.parse().unwrap_or(0.0);
+        let recent = e.store.resolved_since(cleared, 30)?;
         Ok(Snapshot {
             agents,
+            archived: e.store.archived()?,
             groups: e.store.groups()?,
             inbox: e.store.items(Some("pending"), 500)?,
             recent,
@@ -401,6 +399,38 @@ async fn open_in_herdr(name: String) -> Res<String> {
     blocking(move |e| e.open_in_herdr(&name)).await
 }
 
+/// Hide everything resolved so far from the Inbox's history.
+#[tauri::command]
+async fn clear_resolved() -> Res<()> {
+    blocking(|e| {
+        e.store
+            .set_pref("inbox_cleared", &drovr_core::store::now().to_string())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn archive_agent(name: String) -> Res<()> {
+    blocking(move |e| e.archive(&name)).await
+}
+
+#[tauri::command]
+async fn unarchive_agent(name: String) -> Res<()> {
+    blocking(move |e| e.unarchive(&name)).await
+}
+
+/// Archive every finished agent; returns how many.
+#[tauri::command]
+async fn archive_finished() -> Res<usize> {
+    blocking(|e| e.archive_finished()).await
+}
+
+/// Continue an agent's session in your own terminal (terminal.external).
+#[tauri::command]
+async fn open_in_terminal(name: String) -> Res<drovr_core::engine::Opened> {
+    blocking(move |e| e.open_in_terminal(&name)).await
+}
+
 // -- inbox --------------------------------------------------------------------
 
 #[tauri::command]
@@ -699,6 +729,17 @@ async fn report_seen(path: String) -> Res<()> {
     blocking(move |e| e.store.mark_report_seen(&path)).await
 }
 
+/// Move a report into the `archive/` folder beside it.
+#[tauri::command]
+async fn archive_report(path: String) -> Res<String> {
+    blocking(move |e| {
+        Ok(drovr_core::reports::archive(&e.cfg, &e.store, &path)?
+            .display()
+            .to_string())
+    })
+    .await
+}
+
 #[tauri::command]
 async fn reports_all_seen() -> Res<()> {
     blocking(|e| e.store.mark_all_reports_seen()).await
@@ -936,6 +977,12 @@ pub fn run() {
             remove_group,
             attach_command,
             open_in_herdr,
+            open_in_terminal,
+            archive_agent,
+            unarchive_agent,
+            archive_finished,
+            clear_resolved,
+            archive_report,
             inbox_answer,
             inbox_reject,
             inbox_mark_ran,

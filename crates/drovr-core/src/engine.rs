@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Auto-wakes allowed per agent in ten minutes, so two agents messaging each
 /// other can't loop forever on your API bill.
@@ -32,6 +32,12 @@ const HERDR_INLINE_MAX: usize = 600;
 /// How long a new herdr pane's shell gets to reach its prompt.
 const HERDR_READY_WAIT: Duration = Duration::from_secs(15);
 const HERDR_READY_POLL: Duration = Duration::from_millis(500);
+
+/// How long herdr gets to answer after `herdr.launch` starts it.
+#[cfg(not(test))]
+const HERDR_LAUNCH_WAIT: Duration = Duration::from_secs(20);
+#[cfg(test)]
+const HERDR_LAUNCH_WAIT: Duration = Duration::from_secs(1);
 
 /// herdr can still report an agent as idle just after it's been prompted, so
 /// a run this new, in seconds, isn't over yet.
@@ -64,6 +70,16 @@ pub struct Engine {
     pub store: Store,
     pub cfg: Config,
     cli: PathBuf,
+}
+
+/// What Open in terminal did.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Opened {
+    /// The agent is still running in this herdr pane, which is now shown.
+    Pane(String),
+    /// A terminal was opened with this script.
+    Terminal(String),
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1259,6 +1275,37 @@ impl Engine {
         Ok(())
     }
 
+    /// Put an agent away. It keeps its output and session, and comes back if
+    /// it's woken.
+    pub fn archive(&self, name: &str) -> Result<()> {
+        if self.agent(name)?.run_state == "working" {
+            bail!("{name} is working; stop it or let it finish first");
+        }
+        self.store.archive_agent(name)
+    }
+
+    pub fn unarchive(&self, name: &str) -> Result<()> {
+        self.store.unarchive_agent(name)
+    }
+
+    /// Archive every agent that's finished: done, stopped or failed, with
+    /// nothing waiting for you. Returns how many.
+    pub fn archive_finished(&self) -> Result<usize> {
+        let archived = self.store.archived()?;
+        let mut n = 0;
+        for a in self.store.agents(None)? {
+            let finished = matches!(
+                self.display_state(&a).as_str(),
+                "done" | "stopped" | "error"
+            );
+            if finished && !archived.contains(&a.name) {
+                self.store.archive_agent(&a.name)?;
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
+
     /// State as shown to the human: `blocked` wins when the agent is waiting on them.
     pub fn display_state(&self, agent: &Agent) -> String {
         if self.store.pending_count(&agent.name).unwrap_or(0) > 0 {
@@ -1983,14 +2030,63 @@ Plan the work, spawn workers with spawn_worker (or coordinate the agents already
         ))
     }
 
+    /// Before you open an agent's session yourself: its live herdr pane,
+    /// shown and returned, when it has one; otherwise refused while it's
+    /// mid-run, so two sessions don't write to one conversation.
+    fn live_pane_or_idle(&self, agent: &Agent) -> Result<Option<String>> {
+        if let Some(pane) = self.focus_live_pane(agent)? {
+            return Ok(Some(pane));
+        }
+        if agent.run_state == "working" {
+            bail!(
+                "{} is mid-run; stop it first so two sessions don't write to the same conversation",
+                agent.name
+            );
+        }
+        Ok(None)
+    }
+
+    /// The command Open in terminal runs: `terminal.external`, or a new
+    /// Terminal window.
+    fn terminal_template(&self) -> &str {
+        match self.cfg.terminal.external.trim() {
+            "" => "open -a Terminal \"{script}\"",
+            t => t,
+        }
+    }
+
+    /// Continue an agent's session in your own terminal, with
+    /// `terminal.external`. An agent still live in a herdr pane is shown
+    /// there instead.
+    pub fn open_in_terminal(&self, name: &str) -> Result<Opened> {
+        let agent = self.agent(name)?;
+        if let Some(pane) = self.live_pane_or_idle(&agent)? {
+            return Ok(Opened::Pane(pane));
+        }
+        let cmd = self.attach_command(name)?;
+        let dir = home().join("agents").join(name);
+        std::fs::create_dir_all(&dir)?;
+        let script = dir.join("open.command");
+        // The shell stays open after Claude Code exits, so the window does too.
+        std::fs::write(
+            &script,
+            format!("#!/bin/zsh -l\n{cmd}\nexec \"${{SHELL:-/bin/zsh}}\" -l\n"),
+        )?;
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))?;
+        }
+        let path = script.display().to_string();
+        let line = shell::fill(self.terminal_template(), &[("script", &path)], &["script"]);
+        shell::sh(&line, None, None, Duration::from_secs(30))?.into_stdout("terminal.external")?;
+        Ok(Opened::Terminal(path))
+    }
+
     /// Open a headless agent's session interactively in a new herdr pane.
     pub fn open_in_herdr(&self, name: &str) -> Result<String> {
         let agent = self.agent(name)?;
-        if let Some(pane) = self.focus_live_pane(&agent)? {
+        if let Some(pane) = self.live_pane_or_idle(&agent)? {
             return Ok(pane);
-        }
-        if agent.run_state == "working" {
-            bail!("{name} is mid-run; stop it first so two sessions don't write to the same conversation");
         }
         let cmd = self.attach_command(name)?;
         let pane = self.herdr_split(&agent.cwd)?;
@@ -2042,7 +2138,46 @@ Plan the work, spawn workers with spawn_worker (or coordinate the agents already
         self.herdr_new_pane(cmd, std::env::var("HERDR_PANE_ID").ok().as_deref())
     }
 
-    fn herdr_new_pane(&self, mut cmd: String, inherited: Option<&str>) -> Result<String> {
+    /// Open a pane, starting herdr first with `herdr.launch` if it isn't
+    /// running.
+    fn herdr_new_pane(&self, cmd: String, inherited: Option<&str>) -> Result<String> {
+        match self.herdr_try_new_pane(cmd.clone(), inherited) {
+            Err(e) if format!("{e:#}").contains("server_not_running") && self.herdr_launch()? => {
+                self.herdr_try_new_pane(cmd, inherited)
+                    .context("started herdr with herdr.launch, then opening the pane failed")
+            }
+            other => other,
+        }
+    }
+
+    /// Run `herdr.launch` and wait for herdr to answer. False when it's not set.
+    fn herdr_launch(&self) -> Result<bool> {
+        if self.cfg.herdr.launch.trim().is_empty() {
+            return Ok(false);
+        }
+        let launch = self.herdr_fill(&self.cfg.herdr.launch, &[]);
+        shell::sh(&launch, None, None, Duration::from_secs(30))?.into_stdout("herdr.launch")?;
+        let list = self.herdr_fill(&self.cfg.herdr.list, &[]);
+        let until = Instant::now() + HERDR_LAUNCH_WAIT;
+        loop {
+            // Each check gets only what's left of the wait, so it stays the
+            // wait in all.
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            if shell::sh(&list, None, None, left)?.ok() {
+                return Ok(true);
+            }
+            std::thread::sleep(HERDR_READY_POLL.min(left));
+        }
+        bail!(
+            "started herdr with herdr.launch, but it didn't answer within {}s",
+            HERDR_LAUNCH_WAIT.as_secs()
+        )
+    }
+
+    fn herdr_try_new_pane(&self, mut cmd: String, inherited: Option<&str>) -> Result<String> {
         if cmd.contains("--current") {
             let pane = match inherited.filter(|pane| !pane.is_empty()) {
                 Some(pane) => pane.to_string(),
@@ -2059,7 +2194,9 @@ Plan the work, spawn workers with spawn_worker (or coordinate the agents already
         let cmd = self.herdr_fill(&self.cfg.herdr.list, &[]);
         let out = shell::sh(&cmd, None, None, Duration::from_secs(10))?
             .into_stdout("herdr pane list")
-            .map_err(|e| anyhow!("couldn't find a herdr pane to split. Is herdr running? {e}"))?;
+            .map_err(|e| {
+                anyhow!("couldn't find a herdr pane to split. Is herdr running? Start it with `herdr`, or set herdr.launch so drovr starts it. {e}")
+            })?;
         focused_pane(&out)
             .ok_or_else(|| anyhow!("herdr has no focused pane to split. Open herdr and try again."))
     }
@@ -3088,8 +3225,27 @@ esac
         .unwrap();
         let mut cfg = Config::default();
         cfg.herdr.command = format!("sh {}", stub.display());
+        // Open in terminal logs the script it would open instead of opening one.
+        cfg.terminal.external = format!("echo terminal {{script}} >> {}", log.display());
         let store = Store::open(&dir.join("t.db")).unwrap();
         (Engine::with(store, cfg, "drovr".into()), log)
+    }
+
+    /// Opens agent `a`'s session, returning the pane it showed, or
+    /// `terminal` when a terminal was opened instead.
+    type Open = fn(&Engine) -> Result<String>;
+
+    /// Open in herdr and Open in terminal.
+    fn openers() -> [(&'static str, Open); 2] {
+        [
+            ("herdr", |e| e.open_in_herdr("a")),
+            ("terminal", |e| {
+                Ok(match e.open_in_terminal("a")? {
+                    Opened::Pane(pane) => pane,
+                    Opened::Terminal(_) => "terminal".into(),
+                })
+            }),
+        ]
     }
 
     fn add_herdr_test_agent(engine: &Engine, backend: &str, pane: &str, state: &str) -> Agent {
@@ -3108,16 +3264,62 @@ esac
     }
 
     #[test]
+    fn archive_done_skips_blocked_and_working_agents() {
+        let dir = std::env::temp_dir().join(format!("drovr-archive-done-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open(&dir.join("t.db")).unwrap();
+        let engine = Engine::with(store, Config::default(), "drovr".into());
+        for (name, state) in [("done", "done"), ("blocked", "done"), ("busy", "working")] {
+            engine
+                .store
+                .add_agent(&Agent {
+                    name: name.into(),
+                    run_state: state.into(),
+                    ..Agent::default()
+                })
+                .unwrap();
+        }
+        // A pending item makes an agent blocked: it's waiting on you.
+        engine
+            .store
+            .add_item(
+                "blocked",
+                "decision",
+                "Which?",
+                "",
+                &[],
+                &serde_json::Value::Null,
+            )
+            .unwrap();
+        assert_eq!(
+            engine.display_state(&engine.agent("blocked").unwrap()),
+            "blocked"
+        );
+
+        assert!(engine.archive("busy").is_err());
+        assert_eq!(engine.archive_finished().unwrap(), 1);
+        assert_eq!(engine.store.archived().unwrap(), ["done"]);
+        // Already archived: nothing more to do.
+        assert_eq!(engine.archive_finished().unwrap(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn opening_a_live_herdr_agent_focuses_its_pane() {
-        for state in ["idle", "working"] {
-            let (engine, log) = engine_with_logging_herdr(&format!("live-{state}"), 0, 0);
-            add_herdr_test_agent(&engine, "herdr", "w1:p2", state);
-            assert_eq!(engine.open_in_herdr("a").unwrap(), "w1:p2", "{state}");
-            assert_eq!(
-                std::fs::read_to_string(&log).unwrap(),
-                "agent get w1:p2\nagent focus w1:p2\n",
-                "{state}"
-            );
+        for (how, open) in openers() {
+            for state in ["idle", "working"] {
+                let case = format!("live-{how}-{state}");
+                let (engine, log) = engine_with_logging_herdr(&case, 0, 0);
+                add_herdr_test_agent(&engine, "herdr", "w1:p2", state);
+                assert_eq!(open(&engine).unwrap(), "w1:p2", "{case}");
+                // Shown in its pane, and no terminal opened.
+                assert_eq!(
+                    std::fs::read_to_string(&log).unwrap(),
+                    "agent get w1:p2\nagent focus w1:p2\n",
+                    "{case}"
+                );
+            }
         }
     }
 
@@ -3150,14 +3352,51 @@ esac
 
     #[test]
     fn opening_a_working_agent_without_a_live_pane_is_refused() {
-        for (case, backend, get) in [("gone-busy", "herdr", 1), ("busy", "headless", 0)] {
-            let (engine, log) = engine_with_logging_herdr(case, get, 0);
-            add_herdr_test_agent(&engine, backend, "w1:p2", "working");
-            let err = engine.open_in_herdr("a").unwrap_err().to_string();
-            assert!(err.contains("mid-run"), "{case}: {err}");
-            let calls = std::fs::read_to_string(&log).unwrap_or_default();
-            assert!(!calls.contains("split"), "{case}: {calls}");
+        for (how, open) in openers() {
+            for (case, backend, get) in [("gone-busy", "herdr", 1), ("busy", "headless", 0)] {
+                let case = format!("{case}-{how}");
+                let (engine, log) = engine_with_logging_herdr(&case, get, 0);
+                add_herdr_test_agent(&engine, backend, "w1:p2", "working");
+                let err = open(&engine).unwrap_err().to_string();
+                assert!(err.contains("mid-run"), "{case}: {err}");
+                let calls = std::fs::read_to_string(&log).unwrap_or_default();
+                assert!(!calls.contains("split"), "{case}: {calls}");
+                assert!(!calls.contains("terminal"), "{case}: {calls}");
+            }
         }
+    }
+
+    #[test]
+    fn open_in_terminal_writes_a_script_that_resumes_the_session() {
+        use std::os::unix::fs::PermissionsExt;
+        let (engine, log) = engine_with_logging_herdr("terminal-script", 0, 0);
+        add_herdr_test_agent(&engine, "headless", "", "idle");
+        engine.store.set_agent("a", "session_id", "s-1").unwrap();
+        let Opened::Terminal(script) = engine.open_in_terminal("a").unwrap() else {
+            panic!("expected a terminal");
+        };
+        let text = std::fs::read_to_string(&script).unwrap();
+        assert!(text.starts_with("#!/bin/zsh -l\ncd /tmp && "), "{text}");
+        assert!(text.contains("--resume s-1"), "{text}");
+        assert!(text.ends_with("exec \"${SHELL:-/bin/zsh}\" -l\n"), "{text}");
+        let mode = std::fs::metadata(&script).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755);
+        // terminal.external ran, with the script's path filled in.
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            format!("terminal {script}\n")
+        );
+    }
+
+    #[test]
+    fn the_default_terminal_quotes_the_script() {
+        let dir = std::env::temp_dir().join(format!("drovr-term-default-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open(&dir.join("t.db")).unwrap();
+        let engine = Engine::with(store, Config::default(), "drovr".into());
+        assert_eq!(engine.terminal_template(), "open -a Terminal \"{script}\"");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3263,6 +3502,107 @@ esac
             assert!(err.contains(want), "{case}: {err}");
             assert!(!err.contains("requires HERDR_PANE_ID"), "{case}: {err}");
         }
+    }
+
+    #[test]
+    fn starts_herdr_with_launch_when_it_isnt_running() {
+        // `list` fails as herdr does with no server until `launch` has run.
+        let up = std::env::temp_dir().join(format!("drovr-herdr-up-{}", std::process::id()));
+        let _ = std::fs::remove_file(&up);
+        let list = format!(
+            r#"if [ -e {up} ]; then printf '%s' '{{"result":{{"panes":[{{"focused":true,"pane_id":"w1:p1"}}]}}}}'; else echo '{{"error":{{"code":"server_not_running"}}}}' >&2; exit 1; fi"#,
+            up = up.display()
+        );
+        let off = engine_with_herdr_stub("launch-off", &list, "");
+        let err = off.herdr_split_from("/tmp", None).unwrap_err().to_string();
+        assert!(err.contains("herdr.launch"), "{err}");
+
+        let mut on = engine_with_herdr_stub("launch-on", &list, "");
+        on.cfg.herdr.launch = format!("touch {}", up.display());
+        assert_eq!(on.herdr_split_from("/tmp", None).unwrap(), "beside-w1:p1");
+        let _ = std::fs::remove_file(&up);
+    }
+
+    #[test]
+    fn a_new_agents_tab_starts_herdr_with_launch_too() {
+        // New agents get a tab (`agent_pane`, `tab create`), not a split. With
+        // no server, herdr 0.9.5 prints this on stderr and exits 1.
+        let dir = std::env::temp_dir().join(format!("drovr-herdr-tab-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let up = dir.join("up");
+        let stub = dir.join("herdr");
+        std::fs::write(
+            &stub,
+            format!(
+                r#"if [ ! -e {up} ]; then
+  echo '{{"id":"cli:tab:create","error":{{"code":"server_not_running","message":"no herdr server is running"}}}}' >&2
+  exit 1
+fi
+case "$1 $2" in
+"tab create") printf '{{"id":"cli:tab:create","result":{{"pane":{{"pane_id":"w2:p1"}}}}}}' ;;
+"pane list") printf '{{"result":{{"panes":[]}}}}' ;;
+esac
+"#,
+                up = up.display()
+            ),
+        )
+        .unwrap();
+        let mut cfg = Config::default();
+        cfg.herdr.command = format!("sh {}", stub.display());
+        let agent = Agent {
+            name: "api".into(),
+            cwd: "/tmp".into(),
+            ..Agent::default()
+        };
+
+        let off = Engine::with(
+            Store::open(&dir.join("off.db")).unwrap(),
+            cfg.clone(),
+            "drovr".into(),
+        );
+        let err = format!("{:#}", off.herdr_agent_pane(&agent).unwrap_err());
+        assert!(err.contains("server_not_running"), "{err}");
+
+        cfg.herdr.launch = format!("touch {}", up.display());
+        let on = Engine::with(
+            Store::open(&dir.join("on.db")).unwrap(),
+            cfg,
+            "drovr".into(),
+        );
+        assert_eq!(on.herdr_agent_pane(&agent).unwrap(), "w2:p1");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_launch_that_never_answers_gives_up_and_says_so() {
+        let dir = std::env::temp_dir().join(format!("drovr-herdr-never-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let stub = dir.join("herdr");
+        std::fs::write(
+            &stub,
+            "echo '{\"error\":{\"code\":\"server_not_running\"}}' >&2\nexit 1\n",
+        )
+        .unwrap();
+        let mut cfg = Config::default();
+        cfg.herdr.command = format!("sh {}", stub.display());
+        cfg.herdr.launch = "true".into();
+        let engine = Engine::with(Store::open(&dir.join("t.db")).unwrap(), cfg, "drovr".into());
+        let started = Instant::now();
+        let agent = Agent {
+            name: "api".into(),
+            cwd: "/tmp".into(),
+            ..Agent::default()
+        };
+        let err = format!("{:#}", engine.herdr_agent_pane(&agent).unwrap_err());
+        assert!(err.contains("didn't answer within"), "{err}");
+        assert!(
+            started.elapsed() < HERDR_LAUNCH_WAIT * 3,
+            "{:?}",
+            started.elapsed()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// An engine whose `herdr` logs each call and answers like the real one,

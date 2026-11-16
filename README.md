@@ -138,7 +138,9 @@ The Agents view shows each agent's output as it runs: text, tool calls with thei
   - **✕** takes the message back and puts its text in the box to edit.
 - **Copy on select:** selecting text in the output copies it. Turn it off with `defaults.copy_on_select = false`.
 - **Stop, Resume, Remove:** Stop ends the current run (it shows while the agent is working). Resume continues the same conversation. **✕** removes the agent and its output in drovr once you click it and then **Remove?**, and dismisses anything of its still in the Inbox; its Claude Code session is kept. If drovr made it a worktree, the worktree is removed too when nothing in it is uncommitted, and kept (with a note saying so) when something is. Its `drovr/<name>` branch always stays, and an agent started later under the same name picks up that branch, or the worktree if it's still there.
-- **Open in herdr:** opens the agent's session interactively in a new herdr pane. If the agent is already running in a herdr pane, it focuses that pane instead. Without herdr, **Copy attach cmd** copies a `cd … && claude --resume …` command for any terminal.
+- **Open in terminal:** continues the agent's conversation in your own terminal, with `terminal.external` (a new Terminal window by default; set it to open iTerm or anything else). Stop the agent first if it's working, so two sessions don't write to one conversation. If it's still running in a herdr pane, that pane is shown instead.
+- **Open in herdr:** opens the agent's session interactively in a new herdr pane. If the agent is already running in a herdr pane, it focuses that pane instead. **Copy cmd** copies a `cd … && claude --resume …` command for any terminal.
+- **Archive:** takes a finished agent out of the list, keeping its output and session; it comes back if it's woken. **Archive done** in the list's header archives every done, stopped or failed agent, and **Archived** shows them again.
 - **Terminal:** a terminal under the output. See below.
 
 ### Terminal
@@ -680,6 +682,7 @@ drovr reads `~/.config/drovr/config.toml`. Every key is optional, and [`config.e
 | `terminal.font_family`, `.font_size` | `""`, `13` | The terminal's font; empty means the app's monospace font. Set a Nerd Font such as `"MesloLGS NF"` if your prompt (powerlevel10k, starship) uses its symbols. |
 | `terminal.option_as_meta` | `false` | Option sends Esc+, like iTerm2's "Esc+" setting, for Option-arrow word jumps in zsh |
 | `terminal.copy_on_select` | `true` | Selecting text in the terminal copies it, like iTerm2 |
+| `terminal.external` | `""` | Opens an agent's session in your terminal (**Open in terminal**). `{script}` is a script that resumes it; it goes in unquoted (so it works inside an AppleScript string), so quote it yourself elsewhere. Empty: `open -a Terminal "{script}"`. For iTerm: `osascript -e 'tell application "iTerm" to create window with default profile command "/bin/zsh -l {script}"'` |
 | `agent_queries.auto_allow` | `[]` | Extra tools lookups may use, beyond the read-only MCP tools drovr recognizes by name |
 | `agent_queries.servers` | `[]` (any) | MCP servers whose read-only tools lookups may use, matched as part of the name (`atlassian` matches `claude_ai_Atlassian`) |
 
@@ -726,10 +729,11 @@ The `[herdr]` keys are command templates. Values substituted into `{placeholders
 | `get` | `{herdr} agent get {target}` |
 | `focus` | `{herdr} agent focus {target}` |
 | `stop` | `{herdr} pane close {pane}` |
+| `launch` | empty: starts herdr where you can see it when drovr needs a pane and herdr isn't running, e.g. `osascript -e 'tell application "iTerm" to create window with default profile command "/opt/homebrew/bin/herdr"'`. It has to return at once, so start herdr through `open` or `osascript` rather than running it directly. The path to herdr is written out because `{herdr}` is shell-quoted, which would break inside the AppleScript string. drovr waits up to 20 seconds for it, then carries on |
 
 Each agent starts in its own herdr tab, named after it, so it gets the full width and your focus stays where it is. To put agents side by side instead, set `agent_pane` to a `pane split` template, though each split halves the width that's left. `split` opens the panes you ask for, with **Run in herdr pane** and **Open in herdr**, next to your focused pane.
 
-herdr's `--current` only works inside one of its own panes. When drovr wasn't started from a herdr pane, it runs the template against herdr's focused pane instead, so herdr has to be running. A template without `--current` runs as written.
+herdr's `--current` only works inside one of its own panes. When drovr wasn't started from a herdr pane, it runs the template against herdr's focused pane instead, so herdr has to be running: start it yourself, or set `launch` and drovr starts it the first time it needs a pane. A template without `--current` runs as written.
 
 If your herdr version takes different arguments, edit these templates instead of the code.
 

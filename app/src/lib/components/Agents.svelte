@@ -72,8 +72,14 @@
     };
   }
 
+  const isArchived = (name: string) => app.snap.archived.includes(name);
   const agents = $derived(
-    app.snap.agents.filter((a) => !filter || `${a.name} ${a.group_name} ${a.ticket} ${a.status}`.toLowerCase().includes(filter.toLowerCase())),
+    app.snap.agents
+      .filter((a) => app.showArchived || !isArchived(a.name))
+      .filter((a) => !filter || `${a.name} ${a.group_name} ${a.ticket} ${a.status}`.toLowerCase().includes(filter.toLowerCase())),
+  );
+  const finished = $derived(
+    app.snap.agents.filter((a) => !isArchived(a.name) && ["done", "stopped", "error"].includes(a.state)).length,
   );
   const grouped = $derived.by(() => {
     const out: { group: string; agents: Agent[] }[] = [];
@@ -86,7 +92,8 @@
     // Groups you created that have no agents yet still show, so you can add some.
     if (!filter) {
       for (const g of app.snap.groups) {
-        if (!out.some((x) => x.group === g.name)) out.push({ group: g.name, agents: [] });
+        const hasAny = app.snap.agents.some((a) => a.group_name === g.name);
+        if (!hasAny && !out.some((x) => x.group === g.name)) out.push({ group: g.name, agents: [] });
       }
     }
     return out.sort((a, b) => (a.group === "" ? 1 : b.group === "" ? -1 : a.group.localeCompare(b.group)));
@@ -193,15 +200,39 @@
     if (app.selected === name) app.selected = app.snap.agents[0]?.name ?? "";
   }
 
-  async function attach() {
+  async function openInHerdr() {
     if (!current) return;
-    if (app.snap.herdr) {
-      await act(() => api.openInHerdr(current.name), `Opened ${current.name} in herdr`);
-    } else {
+    await act(() => api.openInHerdr(current.name), `Opened ${current.name} in herdr`);
+  }
+
+  async function openInTerminal() {
+    if (!current) return;
+    const name = current.name;
+    const r = await act(() => api.openInTerminal(name));
+    if (r) toast(r.pane ? `${name} is still running in herdr pane ${r.pane}; showed it there` : `Opened ${name} in your terminal`);
+  }
+
+  async function copyAttach() {
+    if (!current) return;
+    try {
       const cmd = await api.attachCommand(current.name);
       await navigator.clipboard.writeText(cmd);
-      toast("Copied a command to open this session in your terminal");
+      toast("Copied a command that continues this session in any terminal");
+    } catch (e) {
+      toast(String(e));
     }
+  }
+
+  /** Archive one agent; if it was selected, move to the next one in the list. */
+  async function archiveOne(name: string) {
+    const next = agents.find((a) => a.name !== name && !isArchived(a.name))?.name ?? "";
+    await act(() => api.archiveAgent(name), `Archived ${name}`);
+    if (!app.showArchived && isArchived(name) && app.selected === name) app.selected = next;
+  }
+
+  async function archiveFinished() {
+    const n = await act(() => api.archiveFinished());
+    if (n !== undefined) toast(n ? `Archived ${n} finished agent${n > 1 ? "s" : ""}` : "Nothing finished to archive");
   }
 
   // Enter sends; Shift+Enter adds a new line. Enter while an input method is
@@ -235,13 +266,17 @@
   <section class="list">
     <div class="head">
       <input placeholder="Filter agents" bind:value={filter} />
+      <button class="ghost" disabled={!finished} onclick={archiveFinished}
+        title="Archive every done, stopped or failed agent. They keep their output and session, and come back if they're woken.">Archive done</button>
+      <button class="ghost" class:on={app.showArchived} disabled={!app.snap.archived.length} onclick={() => (app.showArchived = !app.showArchived)}
+        title={app.showArchived ? "Hide archived agents" : "Show archived agents in the list"}>Archived {app.snap.archived.length || ""}</button>
       <button class="ghost" title={allCollapsed ? "Expand all groups" : "Collapse all groups"}
         onclick={() => setCollapsed(Object.fromEntries(grouped.map((g) => [g.group, !allCollapsed])))}>{allCollapsed ? "⊞" : "⊟"}</button>
     </div>
     {#if interrupted.length}
       <div class="interrupted">
         <span class="grow">{interrupted.length} agent{interrupted.length > 1 ? "s were" : " was"} interrupted by a restart</span>
-        <button onclick={resumeAll}>Resume all</button>
+        <button onclick={resumeAll} title="Resume every interrupted agent where it left off">Resume all</button>
       </div>
     {/if}
     <div class="scroll grow">
@@ -283,7 +318,7 @@
           </div>
         {/if}
         {#each isCollapsed(g.group) ? [] : g.agents as a}
-          <button class="agent" class:sel={a.name === app.selected} class:lead={a.role === "orchestrator"} onclick={() => (app.selected = a.name)}>
+          <button class="agent" class:sel={a.name === app.selected} class:lead={a.role === "orchestrator"} class:archived={isArchived(a.name)} onclick={() => (app.selected = a.name)}>
             <div class="row">
               <span class="name grow">{a.role === "orchestrator" ? "★ " : ""}{a.name}</span>
               {#if a.stage}<span class="pill stage" title="Its stage in the ticket workflow">{a.stage}</span>{/if}
@@ -306,16 +341,26 @@
           <h2 class="grow">{current.name}</h2>
           <span class="pill s-{current.state}">{current.state}</span>
           {#if current.state === "working"}
-            <button class="danger" onclick={() => act(() => api.stop(current.name), "Stopped")}>Stop</button>
+            <button class="danger" onclick={() => act(() => api.stop(current.name), "Stopped")} title="Stop its current run. Its session is kept, so you can resume it.">Stop</button>
           {:else if current.state === "stopped" || current.state === "error" || current.state === "interrupted"}
-            <button onclick={() => act(() => api.resume(current.name), "Resumed")}>Resume</button>
+            <button onclick={() => act(() => api.resume(current.name), "Resumed")} title="Start a new run that continues where it left off">Resume</button>
           {/if}
-          <button onclick={attach} title="Open this session interactively">{app.snap.herdr ? "Open in herdr" : "Copy attach cmd"}</button>
-          <button onclick={() => { app.view = "review"; }}>Review</button>
+          <button onclick={openInTerminal} title="Continue this agent's conversation in your own terminal (terminal.external). Stop it first if it's working.">Open in terminal</button>
+          {#if app.snap.herdr}
+            <button onclick={openInHerdr} title="Continue this agent's conversation in a new herdr pane, or show the pane it's already running in">Open in herdr</button>
+          {/if}
+          <button class="ghost" onclick={copyAttach} title="Copy a command that continues this conversation in any terminal">Copy cmd</button>
+          <button onclick={() => { app.view = "review"; }} title="See what this agent changed in each repo it worked in">Review</button>
           {#if currentTickets.length}
             <button onclick={() => (app.timeline = currentTickets[0])} title={`Everything that happened on ${currentTickets.join(", ")}, for review and the retro`}>Timeline</button>
           {/if}
-          <button class:on={app.termOpen} onclick={() => (app.termOpen = !app.termOpen)} title="Show or hide the terminal (⌃`)">Terminal</button>
+          <button class:on={app.termOpen} onclick={() => (app.termOpen = !app.termOpen)} title="Show or hide the terminal panel in the agent's folder (⌃`)">Terminal</button>
+          {#if isArchived(current.name)}
+            <button class="ghost" onclick={() => act(() => api.unarchiveAgent(current!.name), "Back in the list")} title="Put it back in the agent list">Unarchive</button>
+          {:else}
+            <button class="ghost" disabled={current.state === "working" || current.state === "blocked"} onclick={() => archiveOne(current!.name)}
+              title={current.state === "blocked" ? "It's waiting on you in the Inbox; answer that first" : "Take it out of the list, keeping its output and session. It comes back if it's woken."}>Archive</button>
+          {/if}
           <button class="ghost danger" class:armed={arming === `a:${current.name}`} title="Stop and remove this agent and its output"
             onclick={() => { const n = current!.name; twice(`a:${n}`, () => removeAgent(n)); }}>{arming === `a:${current.name}` ? "Remove?" : "✕"}</button>
         </div>
@@ -328,7 +373,7 @@
           <span>updated {ago(current.updated)} ago</span>
         </div>
         {#if pending.length}
-          <button class="needs" onclick={() => (app.view = "inbox")}>⚑ {pending.length} item{pending.length > 1 ? "s" : ""} waiting for you in the Inbox</button>
+          <button title="Go to the Inbox to answer what this agent is waiting on" class="needs" onclick={() => (app.view = "inbox")}>⚑ {pending.length} item{pending.length > 1 ? "s" : ""} waiting for you in the Inbox</button>
         {/if}
       </header>
 
@@ -374,7 +419,7 @@
       <footer>
         <textarea rows="3" bind:value={input} onkeydown={onKey}
           placeholder={current.state === "working" ? "It's busy, so this is queued until its run ends. Enter sends, Shift+Enter for a new line" : "Prompt this agent. Enter sends, Shift+Enter for a new line"}></textarea>
-        <button class="primary" onclick={send} disabled={!input.trim()}>Send</button>
+        <button title="Send this message to the agent (Enter). If it's working, it's queued until the run ends." class="primary" onclick={send} disabled={!input.trim()}>Send</button>
       </footer>
       {#if app.termOpen}<TerminalPanel agent={current} />{/if}
     {:else}
@@ -407,6 +452,7 @@
   .agent { display: block; width: 100%; text-align: left; background: transparent; border: none; border-left: 2px solid transparent; border-radius: 0; padding: 7px 12px; }
   .agent.sel { background: var(--panel-2); border-left-color: var(--accent); }
   .agent.lead .name { color: var(--purple); }
+  .agent.archived { opacity: .55; }
   .name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; }
   .status { font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .detail { display: flex; flex-direction: column; min-height: 0; min-width: 0; }
@@ -432,6 +478,5 @@
   footer { display: flex; gap: 8px; padding: 10px 16px; border-top: 1px solid var(--border); align-items: flex-end; }
   .cost { color: var(--yellow); border-color: var(--yellow); }
   .stage { color: var(--green); border-color: var(--green); }
-  button.on { border-color: var(--accent); color: var(--accent); }
   button.armed, button.armed:hover { background: var(--red); color: #fff; border-color: var(--red); opacity: 1; }
 </style>

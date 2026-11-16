@@ -427,6 +427,12 @@ pub struct Herdr {
     pub get: String,
     /// Shows a running agent's pane. `{target}` is the pane.
     pub focus: String,
+    /// Starts herdr where you can see it, for when drovr needs a pane and no
+    /// herdr is running: e.g. an iTerm window running herdr. drovr then waits
+    /// for it and carries on. It has to return at once (`open`, `osascript`):
+    /// a command that runs herdr in the foreground blocks drovr until it
+    /// times out. Empty: you start herdr yourself.
+    pub launch: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -490,6 +496,12 @@ pub struct Terminal {
     /// Copy text to the clipboard as soon as you select it, like iTerm2's
     /// "Copy to pasteboard on selection".
     pub copy_on_select: bool,
+    /// Opens an agent's session in your own terminal (Agents → Open in
+    /// terminal). `{script}` is a script that `cd`s to the agent's folder and
+    /// resumes its conversation. It goes in as is, not quoted, so it can sit
+    /// inside an AppleScript string; quote it yourself elsewhere. Empty:
+    /// `open -a Terminal "{script}"`.
+    pub external: String,
 }
 
 impl Default for Terminal {
@@ -500,6 +512,7 @@ impl Default for Terminal {
             font_size: 13,
             option_as_meta: false,
             copy_on_select: true,
+            external: String::new(),
         }
     }
 }
@@ -659,6 +672,7 @@ impl Default for Herdr {
             stop: "{herdr} pane close {pane}".into(),
             get: "{herdr} agent get {target}".into(),
             focus: "{herdr} agent focus {target}".into(),
+            launch: String::new(),
         }
     }
 }

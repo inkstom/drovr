@@ -80,6 +80,11 @@ CREATE TABLE IF NOT EXISTS prefs (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+-- Agents you've put away: kept with their output, out of the list.
+CREATE TABLE IF NOT EXISTS archived (
+    name TEXT PRIMARY KEY,
+    ts REAL NOT NULL
+);
 CREATE TABLE IF NOT EXISTS notes (
     group_name TEXT NOT NULL,
     key TEXT NOT NULL,
@@ -440,6 +445,8 @@ impl Store {
         if n == 0 {
             return Ok(None);
         }
+        // An archived agent that's woken comes back to the list.
+        self.unarchive_agent(name)?;
         Ok(self.agent(name)?.map(|a| a.runs))
     }
 
@@ -461,7 +468,30 @@ impl Store {
         Ok(())
     }
 
+    /// Put an agent away: it leaves the list but keeps its output and session.
+    pub fn archive_agent(&self, name: &str) -> Result<()> {
+        self.db.execute(
+            "INSERT OR REPLACE INTO archived (name, ts) VALUES (?1, ?2)",
+            params![name, now()],
+        )?;
+        Ok(())
+    }
+
+    pub fn unarchive_agent(&self, name: &str) -> Result<()> {
+        self.db
+            .execute("DELETE FROM archived WHERE name = ?1", [name])?;
+        Ok(())
+    }
+
+    /// The names of archived agents.
+    pub fn archived(&self) -> Result<Vec<String>> {
+        let mut stmt = self.db.prepare("SELECT name FROM archived ORDER BY ts")?;
+        let rows = stmt.query_map([], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     pub fn remove_agent(&self, name: &str) -> Result<()> {
+        self.unarchive_agent(name)?;
         self.db
             .execute("DELETE FROM agents WHERE name = ?1", [name])?;
         self.db
@@ -793,6 +823,34 @@ mod tests {
         st.set_pref("inbox_cleared", "12.5").unwrap();
         st.set_pref("inbox_cleared", "13").unwrap();
         assert_eq!(st.pref("inbox_cleared").unwrap(), "13");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn archived_agents_come_back_when_woken_or_removed() {
+        let dir = std::env::temp_dir().join(format!("drovr-archive-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let st = Store::open(&dir.join("t.db")).unwrap();
+        for name in ["api", "web"] {
+            st.add_agent(&Agent {
+                name: name.into(),
+                run_state: "done".into(),
+                ..Agent::default()
+            })
+            .unwrap();
+        }
+        st.archive_agent("api").unwrap();
+        st.archive_agent("web").unwrap();
+        // Archiving twice keeps one entry.
+        st.archive_agent("api").unwrap();
+        assert_eq!(st.archived().unwrap(), ["web", "api"]);
+        // Waking it brings it back to the list.
+        st.claim_run("api").unwrap();
+        assert_eq!(st.archived().unwrap(), ["web"]);
+        // Removing it forgets that it was archived.
+        st.remove_agent("web").unwrap();
+        assert!(st.archived().unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

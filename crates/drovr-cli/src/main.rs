@@ -32,6 +32,7 @@ usage:
   drovr msgs [group]                         the message bus
   drovr ask <question...>                    ask an agent with your MCPs (Slack, Jira, …)
   drovr term <agent>                         continue an agent's session in your terminal (terminal.external)
+  drovr archive <agent> | archive done       put an agent away (keeping its output), or every finished one
   drovr config                               where drovr reads its config and keeps its data
   drovr remote [--test]                      the phone page's sign-in link and QR code;
                                              --test sends a test push notification
@@ -276,6 +277,10 @@ fn run() -> Result<()> {
                 drovr_core::engine::Opened::Terminal(script) => println!("{script}"),
             }
         }
+        "archive" => match arg(&args, 1, "agent name, or done")? {
+            "done" => println!("archived {}", engine.archive_finished()?),
+            name => engine.archive(name)?,
+        },
         "config" => println!(
             "{}",
             json!({ "config": drovr_core::config::config_path(), "home": drovr_core::config::home() })

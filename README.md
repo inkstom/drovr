@@ -140,6 +140,7 @@ The Agents view shows each agent's output as it runs: text, tool calls with thei
 - **Stop, Resume, Remove:** Stop ends the current run (it shows while the agent is working). Resume continues the same conversation. **✕** removes the agent and its output in drovr once you click it and then **Remove?**, and dismisses anything of its still in the Inbox; its Claude Code session is kept. If drovr made it a worktree, the worktree is removed too when nothing in it is uncommitted, and kept (with a note saying so) when something is. Its `drovr/<name>` branch always stays, and an agent started later under the same name picks up that branch, or the worktree if it's still there.
 - **Open in terminal:** continues the agent's conversation in your own terminal, with `terminal.external` (a new Terminal window by default; set it to open iTerm or anything else). Stop the agent first if it's working, so two sessions don't write to one conversation. If it's still running in a herdr pane, that pane is shown instead.
 - **Open in herdr:** opens the agent's session interactively in a new herdr pane. If the agent is already running in a herdr pane, it focuses that pane instead. **Copy cmd** copies a `cd … && claude --resume …` command for any terminal.
+- **Archive:** takes a finished agent out of the list, keeping its output and session; it comes back if it's woken. **Archive done** in the list's header archives every done, stopped or failed agent, and **Archived** shows them again.
 - **Terminal:** a terminal under the output. See below.
 
 ### Terminal

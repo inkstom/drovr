@@ -110,8 +110,6 @@
     await act(() => api.prompt(target, msg), `Sent to ${target}`);
     feedback = "";
   }
-
-  const folderPath = (folder: string) => (folder ? `${dir}/${folder}` : dir);
 </script>
 
 {#snippet item(f: ReportFile, old: boolean)}
@@ -170,7 +168,7 @@
         <strong class="grow t" title={current.path}>{current.title}</strong>
         <button onclick={() => frameKey++} title="Load the page again, after an agent revised it">Reload</button>
         <button onclick={() => api.openPath(current!.path).catch((e) => toast(String(e)))} title="Open this report in your default browser">Open in browser</button>
-        <button onclick={() => api.openPath(folderPath(current!.folder)).catch((e) => toast(String(e)))} title="Show the folder this report is in, in Finder">Show folder</button>
+        <button onclick={() => api.openPath(current!.dir).catch((e) => toast(String(e)))} title="Show the folder this report is in, in Finder">Show folder</button>
         <button class="ghost" onclick={archiveCurrent} title="Move this report into an archive folder beside it, out of this list. The file is kept.">Archive</button>
       </div>
       {#key frameKey}<iframe title={current.title} src={api.fileSrc(current.path)}></iframe>{/key}

@@ -79,16 +79,18 @@ drovr dispatch SRE-3253 group ~/code/pay-api
 3. **New agent** opens with the group selected. Pick a file under **Prompt from file**: it fills in the task, which you can edit. Then **Start**.
 4. Add the group's other agents with **+ agent** on the group's header in **Agents**. Add a lead any time with **+ lead**.
 
-### Pick up an existing Claude Code session
+### Pick up an existing Claude Code or OpenCode session
 
-1. **New agent** (⌘N) → **Existing Claude session**.
-2. Choose a recent session, or paste the ID you'd give `claude --resume <id>`. The working directory fills in from the session.
+1. **New agent** (⌘N) → **Existing session**.
+2. Choose a recent session, or paste the ID you'd give `claude --resume <id>`. The working directory fills in from the session. For an OpenCode session, set **Run with** to **OpenCode** to list OpenCode's sessions instead, or paste its `ses_…` ID, which picks OpenCode for you.
 3. Leave Task empty to carry on, or type what to do next. Turn on **Fork** if the session is still open somewhere else.
 
 ```sh
 drovr sessions                                      # recent sessions: id, folder, first prompt
 drovr adopt 225e9ac0-9c9c-4f7c-927e-49054bff82a0 env-coord
 drovr adopt 225e9ac0-9c9c-4f7c-927e-49054bff82a0 env-copy --fork "Now write the tests"
+drovr sessions --harness opencode                   # OpenCode's sessions
+drovr adopt ses_4f2a1c login-fix                    # a ses_… ID is an OpenCode session
 ```
 
 ### Answer what agents need from you
@@ -159,6 +161,7 @@ drovr msgs pay-api
 ```sh
 drovr log pay-api-lead 100
 drovr attach pay-api-lead          # prints: cd … && claude --resume …
+                                   # (an OpenCode agent: cd … && OPENCODE_CONFIG=… opencode --standalone --session …)
 ```
 
 ### Look things up in Jira, Confluence and Slack
@@ -213,6 +216,31 @@ drovr remote          # the sign-in link and QR code
 drovr remote --test   # send a test notification
 drovr serve           # the page and notifications without the app
 ```
+
+### Run an agent with OpenCode
+
+1. Install OpenCode 2 and connect a provider (`opencode auth login`). Set `opencode.model` to a `provider/model` from `opencode models` if you don't want OpenCode's default.
+2. In **New agent**, **New group** (with an orchestrator) or **Hand off**, set **Run with** to **OpenCode**. It's greyed out until drovr finds `opencode` (`opencode.command`).
+3. The agent works like any headless Claude Code agent: messages, the Inbox, reports, Code review, costs, and permission requests. Its tool calls are checked the same way (`permissions.auto_allow`, `defaults.permission_mode`), so `shell` commands come to your Inbox as **Bash** permission requests.
+
+```sh
+drovr new --harness opencode fix-ci ~/code/api "Make CI green"
+drovr group --harness opencode checkout-v2 ~/code/web "Move checkout to the new payments API"
+```
+
+Set `defaults.harness = "opencode"` to make OpenCode the preselected choice. **Run in → herdr pane** runs it in OpenCode's TUI in a herdr tab, where you answer its permission prompts yourself; install herdr's OpenCode integration (`herdr integration install opencode`) so herdr reports its state and session exactly. OpenCode's TUI can't fork a session, so adopt with **Fork** runs headless. **Copy attach cmd** opens a headless one in OpenCode's TUI.
+
+drovr starts every OpenCode run and TUI with `--standalone`: a server of its own rather than OpenCode's background service, which wouldn't read the config drovr writes for the agent.
+
+#### OpenCode through a gateway or custom provider
+
+drovr leaves OpenCode's providers to your own config. The config drovr writes for an agent adds only its MCP server, system prompt and permission plugin (and, for the TUI, `opencode.model` and `opencode.agent`), and OpenCode reads it on top of `~/.config/opencode/opencode.json`. Your providers, `enabled_providers`, MCP servers and the plugins in `~/.config/opencode/plugins/` (a token refresher, say) still apply to drovr's agents. Once `opencode run` works in a terminal:
+
+1. Set `opencode.model` to the gateway's model exactly as `opencode models` lists it, for example `"my-gateway/anthropic/claude-sonnet-5.5"`. A gateway's IDs can differ from the provider's own (dots rather than dashes), and one it doesn't know fails the run with `provider.no-route`. Leave it empty to use the `model` in your OpenCode config.
+2. If **Run with → OpenCode** says `opencode not found`, set `opencode.command` to its full path (for example `/Users/you/.opencode/bin/opencode`).
+3. Allow the gateway's MCP tools by Claude Code's names: a server `my_gateway`'s tool `search` is `mcp__my_gateway__search` in `permissions.auto_allow`.
+
+Costs come from what OpenCode reports for each step. If your OpenCode setup has no prices for a gateway's models, its runs show $0 and `defaults.cost_warning_usd` never flags them.
 
 ### Run an agent with Codex (experimental)
 
@@ -302,11 +330,11 @@ Agent and group names are lowercase letters, digits, `-` and `_`, starting with 
 | `drovr ls` | List agents: group, role, state, cost, status |
 | `drovr new <name> <cwd> <task…>` | Start a solo agent |
 | `drovr group <name> <cwd> <goal…>` | Start a group with an orchestrator |
-| `… --harness claude\|codex` | With `new`, `group` or `dispatch`: the CLI that runs the agents (default `defaults.harness`) |
+| `… --harness claude\|opencode\|codex` | With `new`, `group`, `dispatch` or `adopt`: the CLI that runs the agents (default `defaults.harness`). With `sessions`: whose sessions to list (default Claude Code) |
 | `drovr dispatch <TICKET> [solo\|group] [cwd]` | Hand a Jira ticket to a new agent or a new group |
 | `drovr dispatch <TICKET> to <group> [agent]` | Hand a Jira ticket to an existing group: its lead, or the agent you name |
-| `drovr sessions` | List recent Claude Code sessions |
-| `drovr adopt <session-id> <name> [--fork] [task…]` | Start an agent from an existing Claude Code session |
+| `drovr sessions` | List recent Claude Code sessions (`--harness opencode`: OpenCode's) |
+| `drovr adopt <session-id> <name> [--fork] [task…]` | Start an agent from an existing Claude Code session, or an OpenCode one (`ses_…`) |
 | `drovr prompt <agent> <text…>` | Send an agent a prompt (queued if it's busy) |
 | `drovr stop <agent>` | Stop an agent's current run |
 | `drovr resume <agent> [text…]` | Resume a stopped, failed or interrupted agent |
@@ -325,4 +353,4 @@ Agent and group names are lowercase letters, digits, `-` and `_`, starting with 
 | `drovr serve` | Serve the phone page and send notifications without the app (see `[remote]` in the config) |
 | `drovr help` | Show this list |
 
-Agents and run wrappers call three internal commands: `drovr mcp --agent <name>` is an agent's MCP server, `drovr hook finished <agent>` runs when a headless run exits, and `drovr status-line <agent>` is a herdr agent's Claude Code status line, which saves its cost.
+Agents and run wrappers call four internal commands: `drovr mcp --agent <name>` is an agent's MCP server, `drovr hook finished <agent>` runs when a headless run exits, `drovr hook permission <agent>` is an OpenCode agent's permission prompt (its plugin passes the tool call on stdin and reads the answer), and `drovr status-line <agent>` is a herdr agent's Claude Code status line, which saves its cost.

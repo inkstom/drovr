@@ -45,6 +45,9 @@ struct HerdrRun {
     total: f64,
     run_cost: f64,
     started: f64,
+    /// When drovr last started the agent in a pane: a CLI that names its
+    /// own sessions starts one after this.
+    opened: f64,
 }
 
 /// Save what an agent's status line was given, for `refresh_herdr` to read.
@@ -478,25 +481,28 @@ impl Engine {
         Ok(crate::review::repos(&a.cwd, &self.transcripts(&a), &shared))
     }
 
-    /// What an agent's headless runs cost, from their logs. Only Claude Code
-    /// reports a cost; Codex reports tokens.
+    /// What an agent's headless runs cost, from their logs. Claude Code and
+    /// OpenCode report a cost; Codex reports tokens.
     fn total_cost(&self, agent: &Agent) -> f64 {
+        self.run_costs(agent)
+            .into_iter()
+            .map(|(_, cost)| cost)
+            .sum()
+    }
+
+    /// Each headless run's session and what the run cost, in order.
+    fn run_costs(&self, agent: &Agent) -> Vec<(String, f64)> {
         let harness = harness::of(agent);
         let dir = home().join("agents").join(&agent.name).join("runs");
         let mut costs = Costs::default();
         (1..=agent.runs)
             .filter_map(|r| std::fs::read_to_string(dir.join(format!("{r}.jsonl"))).ok())
-            .filter_map(|log| {
-                log.lines()
-                    .rev()
-                    .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-                    .find_map(|v| match harness.parse(&v) {
-                        Event::End(end) => Some(end),
-                        _ => None,
-                    })
+            .filter_map(|log| run_end(&log, harness))
+            .map(|end| {
+                let cost = harness.run_cost(&end, &mut costs).unwrap_or(0.0);
+                (end["session_id"].as_str().unwrap_or("").to_string(), cost)
             })
-            .map(|end| harness.run_cost(&end, &mut costs).unwrap_or(0.0))
-            .sum()
+            .collect()
     }
 
     pub(crate) fn agent_dir(&self, name: &str) -> PathBuf {
@@ -644,7 +650,7 @@ impl Engine {
             harness: harness.name().into(),
             run_state: "idle".into(),
             cwd,
-            // Codex names the session when the first run starts.
+            // Codex and OpenCode name the session when the first run starts.
             session_id: match &resumed {
                 Some(s) => s.id.clone(),
                 None if harness.picks_session_id() => uuid::Uuid::new_v4().to_string(),
@@ -791,16 +797,17 @@ impl Engine {
     /// Whether the next run starts the agent's session, continues it, or
     /// continues a copy of an adopted one.
     fn session(&self, agent: &Agent) -> Session {
-        if !harness::of(agent).picks_session_id() {
-            return if agent.session_id.is_empty() {
-                Session::New
-            } else {
-                Session::Resume
-            };
-        }
         match self.resume_mode(&agent.name).as_deref() {
             Some("fork") => Session::Fork,
             Some(_) => Session::Resume,
+            // Codex and OpenCode name the session when the first run starts.
+            None if !harness::of(agent).picks_session_id() => {
+                if agent.session_id.is_empty() {
+                    Session::New
+                } else {
+                    Session::Resume
+                }
+            }
             None if self.session_logged(&agent.name) => Session::Resume,
             None => Session::New,
         }
@@ -828,6 +835,7 @@ impl Engine {
             cli: self.cli.clone(),
             home: home(),
             mcp_config: self.mcp_config(&agent.name)?,
+            dir: self.agent_dir(&agent.name),
             system_prompt: self.system_prompt_file(agent)?,
             settings_file: self.agent_dir(&agent.name).join("herdr-settings.json"),
             session,
@@ -848,7 +856,9 @@ impl Engine {
         } else {
             self.session(agent)
         };
-        let args = harness.headless_args(&self.run_for(agent, session)?)?;
+        let start = self.run_for(agent, session)?;
+        let args = harness.headless_args(&start)?;
+        let env = harness.headless_env(&start)?;
         self.record(
             &agent.name,
             "run_start",
@@ -880,6 +890,7 @@ impl Engine {
             .env("DROVR_AGENT", &agent.name)
             .env("DROVR_HOME", home())
             .envs(crate::datadog::env(&self.cfg))
+            .envs(env)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -910,18 +921,19 @@ impl Engine {
         if let Some(log) = &log {
             let harness = harness::of(&agent);
             let mut session = None;
+            let mut state = Value::Null;
             for v in log
                 .lines()
                 .filter_map(|l| serde_json::from_str::<Value>(l).ok())
             {
-                match harness.parse(&v) {
+                match harness.parse(&v, &mut state) {
                     Event::Session(id) if session.is_none() => session = Some(id),
                     Event::End(e) => end = Some(e),
                     _ => {}
                 }
             }
-            // A forked session gets a new ID, and Codex names its session
-            // when the first run starts: keep following it.
+            // A forked session gets a new ID, and Codex and OpenCode name
+            // their sessions when the first run starts: keep following it.
             let fork = self.resume_mode(name).as_deref() == Some("fork");
             if fork || !harness.picks_session_id() {
                 if let Some(id) = session.filter(|id| !id.is_empty() && *id != agent.session_id) {
@@ -946,7 +958,20 @@ impl Engine {
             _ => "idle",
         };
         self.store.set_agent(name, "run_state", next)?;
-        let end = end.unwrap_or_default();
+        let mut end = end.unwrap_or_default();
+        // A CLI that reports each run's own cost (OpenCode) leaves the
+        // session's running total to drovr: the stage checkpoint reads it.
+        if end["total_cost_usd"].is_null() && end["cost_usd"].is_number() {
+            if let Some(session) = end["session_id"].as_str().filter(|s| !s.is_empty()) {
+                let total: f64 = self
+                    .run_costs(&self.agent(name)?)
+                    .into_iter()
+                    .filter(|(s, _)| s == session)
+                    .map(|(_, cost)| cost)
+                    .sum();
+                end["total_cost_usd"] = json!(total);
+            }
+        }
         self.record(
             name,
             "run_end",
@@ -2045,14 +2070,35 @@ Plan the work, spawn workers with spawn_worker (or coordinate the agents already
         session: Session,
         first: Option<&str>,
     ) -> Result<()> {
-        let args = harness::of(agent).herdr_args(&self.run_for(agent, session)?)?;
+        let harness = harness::of(agent);
+        let start_run = self.run_for(agent, session)?;
+        let args = harness.herdr_args(&start_run)?;
+        let env = harness.herdr_env(&start_run)?;
         let pane = self.herdr_agent_pane(agent)?;
         self.store.set_agent(&agent.name, "pane", &pane)?;
+        let mut state = self.herdr_load_run(&agent.name);
+        state.opened = crate::store::now();
+        self.herdr_save_run(&agent.name, &state)?;
+        // herdr starts the agent from the pane's shell, so what it needs
+        // from the environment is exported there first.
+        if !env.is_empty() {
+            let line = env
+                .iter()
+                .map(|(k, v)| format!("{k}={}", quote(v)))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let export = self.herdr_fill(
+                &self.cfg.herdr.run,
+                &[("pane", &pane), ("cmd", &format!("export {line}"))],
+            );
+            self.herdr_start_when_ready(&agent.name, &export, &pane, HERDR_READY_WAIT)?;
+        }
         let args: Vec<String> = args.iter().map(|a| quote(a)).collect();
         let start = self.herdr_fill(
-            &self.cfg.herdr.start,
+            &herdr_start_template(&self.cfg.herdr.start),
             &[
                 ("name", &herdr_name(&agent.name)),
+                ("kind", harness.herdr_kind()),
                 ("pane", &pane),
                 ("args", &args.join(" ")),
             ],
@@ -2093,10 +2139,17 @@ Plan the work, spawn workers with spawn_worker (or coordinate the agents already
     fn herdr_track_cost(&self, name: &str) -> Result<(HerdrRun, Option<harness::Live>)> {
         let agent = self.agent(name)?;
         let mut run = self.herdr_load_run(name);
+        let harness = harness::of(&agent);
+        // Claude Code's status line reports it; OpenCode's database has it.
         let live = std::fs::read_to_string(self.agent_dir(name).join("status-line.json"))
             .ok()
             .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-            .and_then(|v| harness::of(&agent).live_status(&v));
+            .and_then(|v| harness.live_status(&v))
+            .or_else(|| {
+                (!agent.session_id.is_empty())
+                    .then(|| harness.session_live(&self.cfg, &agent.session_id))
+                    .flatten()
+            });
         if let Some(live) = &live {
             // A lower total means a new count (a new or forked session).
             let added = if live.session == run.session && live.total_cost_usd >= run.total {
@@ -2253,6 +2306,34 @@ Plan the work, spawn workers with spawn_worker (or coordinate the agents already
             .collect())
     }
 
+    /// For a CLI that names its own sessions (OpenCode), keep the session
+    /// a herdr agent is in: the one herdr's integration reports, else, once
+    /// a run ends and drovr doesn't know it yet (or the start forked one),
+    /// the newest started in its folder since its pane opened.
+    fn herdr_learn_session(&self, agent: &Agent, get: &str, ended: bool) -> Result<()> {
+        let harness = harness::of(agent);
+        if harness.picks_session_id() {
+            return Ok(());
+        }
+        let fork = self.resume_mode(&agent.name).as_deref() == Some("fork");
+        let id = herdr_session(get).or_else(|| {
+            (ended && (agent.session_id.is_empty() || fork))
+                .then(|| {
+                    let opened = self.herdr_load_run(&agent.name).opened;
+                    harness.latest_session(&self.cfg, &agent.cwd, opened)
+                })
+                .flatten()
+        });
+        if let Some(id) = id.filter(|id| *id != agent.session_id) {
+            self.store.set_agent(&agent.name, "session_id", &id)?;
+            if fork {
+                std::fs::write(self.agent_dir(&agent.name).join("resumed"), "same")?;
+            }
+            self.record(&agent.name, "session", json!({ "session": id }));
+        }
+        Ok(())
+    }
+
     /// Map herdr's view of agent states (working/blocked/done/idle) onto ours.
     pub fn refresh_herdr(&self) -> Result<()> {
         for agent in self.store.agents(None)? {
@@ -2271,6 +2352,9 @@ Plan the work, spawn workers with spawn_worker (or coordinate the agents already
                 self.store.set_agent(&agent.name, "run_state", "stopped")?;
                 continue;
             }
+            let ended = agent.run_state == "working"
+                && matches!(herdr_status(&out.stdout).as_deref(), Some("idle" | "done"));
+            self.herdr_learn_session(&agent, &out.stdout, ended)?;
             let (run, _) = self.herdr_track_cost(&agent.name)?;
             let state = match herdr_status(&out.stdout).as_deref() {
                 Some("working") | Some("blocked") => "working",
@@ -2339,6 +2423,29 @@ fn herdr_status(stdout: &str) -> Option<String> {
         .as_str()
         .map(String::from)
         .or_else(|| find_key(&v, &["agent_status", "state", "status"]))
+}
+
+/// The session herdr's integration reports for an agent in `herdr agent
+/// get` output: `agent_session: {"agent": "opencode", "kind": "id",
+/// "value": "ses_…"}`.
+fn herdr_session(stdout: &str) -> Option<String> {
+    let v: Value = serde_json::from_str(stdout).ok()?;
+    let s = &v["result"]["agent"]["agent_session"];
+    (s["kind"] == "id")
+        .then(|| s["value"].as_str())
+        .flatten()
+        .filter(|id| !id.is_empty())
+        .map(String::from)
+}
+
+/// The `herdr.start` template with the agent's kind as `{kind}`. A config
+/// written before OpenCode ran in herdr says `--kind claude`.
+fn herdr_start_template(template: &str) -> String {
+    if template.contains("{kind}") {
+        template.to_string()
+    } else {
+        template.replace("--kind claude", "--kind {kind}")
+    }
 }
 
 /// herdr agent names: `[a-z][a-z0-9_-]{0,31}`.
@@ -2411,6 +2518,18 @@ fn result_line(v: &Value, harness: &dyn Harness, costs: &mut Costs) -> Line {
     }
 }
 
+/// How a run ended (its last `Event::End`), from its whole log.
+fn run_end(log: &str, harness: &dyn Harness) -> Option<Value> {
+    let mut state = Value::Null;
+    log.lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter_map(|v| match harness.parse(&v, &mut state) {
+            Event::End(end) => Some(end),
+            _ => None,
+        })
+        .last()
+}
+
 /// One event of a run log, ready to show. The end of a run keeps what its
 /// line needs, since its cost is worked out when the output is put together.
 #[derive(Clone)]
@@ -2427,6 +2546,8 @@ struct RunLog {
     ino: u64,
     parsed_to: u64,
     items: Arc<Vec<Rendered>>,
+    /// What the harness kept from the lines parsed so far.
+    state: Value,
 }
 
 /// Run logs already parsed in this process. The app asks for an agent's
@@ -2452,6 +2573,7 @@ fn rendered_log(path: &Path, harness: &dyn Harness) -> Arc<Vec<Rendered>> {
         ino: meta.ino(),
         parsed_to: 0,
         items: Arc::default(),
+        state: Value::Null,
     };
     let log = logs.entry(path.to_path_buf()).or_insert_with(fresh);
     if log.ino != meta.ino() || meta.len() < log.parsed_to {
@@ -2475,7 +2597,7 @@ fn rendered_log(path: &Path, harness: &dyn Harness) -> Arc<Vec<Rendered>> {
             let Ok(v) = serde_json::from_str::<Value>(line) else {
                 continue;
             };
-            match harness.parse(&v) {
+            match harness.parse(&v, &mut log.state) {
                 Event::Lines(lines) => items.extend(lines.into_iter().map(Rendered::Line)),
                 Event::End(end) => items.push(Rendered::Result(end)),
                 Event::Session(_) | Event::Skip => {}
@@ -2947,6 +3069,31 @@ mod tests {
         let out = r#"{"id":"cli:agent:get","result":{"agent":{"agent":"claude","agent_session":{"agent":"claude","kind":"id","source":"herdr:claude","value":"225e9ac0-9c9c-4f7c-927e-49054bff82a0"},"agent_status":"done","cwd":"/Users/x/develop","focused":false,"pane_id":"w7:p1","revision":32,"state_change_seq":1578,"tab_id":"w7:t1","terminal_id":"term_65e3465ece130d","terminal_title":"✳ pay-api coordinator session restart","workspace_id":"w7"},"type":"agent_info"}}"#;
         assert_eq!(herdr_status(out).as_deref(), Some("done"));
         assert_eq!(herdr_status("not json"), None);
+        assert_eq!(
+            herdr_session(out).as_deref(),
+            Some("225e9ac0-9c9c-4f7c-927e-49054bff82a0")
+        );
+        let opencode = r#"{"result":{"agent":{"agent":"opencode","agent_session":{"agent":"opencode","kind":"id","source":"herdr:opencode","value":"ses_4f2a1c"},"agent_status":"idle"}}}"#;
+        assert_eq!(herdr_session(opencode).as_deref(), Some("ses_4f2a1c"));
+        // Without herdr's integration there's no session to read.
+        assert_eq!(
+            herdr_session(r#"{"result":{"agent":{"agent_status":"idle"}}}"#),
+            None
+        );
+    }
+
+    #[test]
+    fn starts_herdr_agents_as_their_kind() {
+        let default = crate::config::Herdr::default().start;
+        assert!(default.contains("--kind {kind}"), "{default}");
+        // A config from before OpenCode ran in herdr.
+        let old = "{herdr} agent start {name} --kind claude --pane {pane} -- {args}";
+        assert_eq!(
+            herdr_start_template(old),
+            "{herdr} agent start {name} --kind {kind} --pane {pane} -- {args}"
+        );
+        let custom = "my-herdr start {name} --type {kind} -- {args}";
+        assert_eq!(herdr_start_template(custom), custom);
     }
 
     /// An engine whose `herdr` is a stub that logs each call to the returned

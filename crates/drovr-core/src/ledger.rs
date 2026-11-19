@@ -78,10 +78,17 @@ pub fn append(cfg: &Config, folder: &str, ticket: &str, event: &Value) -> Result
 
 /// Holds an flock until dropped, so lines from several processes don't
 /// interleave.
-struct Lock(i32);
+pub(crate) struct Lock(i32);
 
 impl Lock {
-    fn exclusive(f: &std::fs::File) -> Lock {
+    /// The lock if nobody holds it, without waiting.
+    pub(crate) fn try_exclusive(f: &std::fs::File) -> Option<Lock> {
+        use std::os::unix::io::AsRawFd;
+        let fd = f.as_raw_fd();
+        (unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } == 0).then_some(Lock(fd))
+    }
+
+    pub(crate) fn exclusive(f: &std::fs::File) -> Lock {
         use std::os::unix::io::AsRawFd;
         let fd = f.as_raw_fd();
         unsafe { libc::flock(fd, libc::LOCK_EX) };
@@ -125,6 +132,9 @@ fn is_retro_event(kind: &str) -> bool {
     kind.starts_with("retro_") || kind.starts_with("proposal_")
 }
 
+/// The plans folder's subfolder that holds archived plans; listings skip it.
+pub const ARCHIVE: &str = "archive";
+
 /// Every record in the plans folder, most recently updated first.
 pub fn list(cfg: &Config) -> Vec<Record> {
     let root = cfg.reports.path();
@@ -164,6 +174,9 @@ pub fn list(cfg: &Config) -> Vec<Record> {
     };
     for entry in subdirs(&root) {
         let name = entry.file_name().to_string_lossy().to_string();
+        if name == ARCHIVE {
+            continue;
+        }
         if is_record(&entry.path()) {
             add(&entry.path(), "", &name);
             continue;

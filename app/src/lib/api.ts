@@ -19,7 +19,7 @@ export type Group = {
 };
 export type NewGroup = { name: string; goal: string; ticket: string; cwd: string; backend: string; harness: string; plans_dir: string; lead: boolean; model?: string };
 export type Defaults = {
-  cwd: string; backend: string; harness: string; model: string; codex_model: string; permission_mode: string; worktrees: boolean; plans_dir: string; your_name: string;
+  cwd: string; backend: string; harness: string; model: string; codex_model: string; opencode_model: string; permission_mode: string; worktrees: boolean; plans_dir: string; your_name: string;
   notify: boolean; cost_warning_usd: number; copy_on_select: boolean;
   /** workflow.enabled: the ticket record and timeline are on. */
   workflow: boolean;
@@ -31,7 +31,7 @@ export type Item = {
   id: number; ts: number; agent: string; kind: string; title: string; body: string;
   options: string[]; payload: any; status: string; answer: string; delivered: boolean;
 };
-export type Snapshot = { agents: Agent[]; groups: Group[]; inbox: Item[]; recent: Item[]; unseen_reports: number; herdr: boolean; codex: boolean };
+export type Snapshot = { agents: Agent[]; groups: Group[]; inbox: Item[]; recent: Item[]; unseen_reports: number; herdr: boolean; codex: boolean; opencode: boolean };
 export type ReportFile = { path: string; folder: string; title: string; modified: number; agent: string; summary: string; seen: boolean };
 export type Line = { kind: string; text: string };
 export type Message = { id: number; ts: number; sender: string; recipient: string; group_name: string; body: string };
@@ -94,15 +94,19 @@ export type NewAgent = {
 };
 export type ClaudeSession = { id: string; cwd: string; first_prompt: string; modified: number };
 
+export interface CliStatus { installed: boolean; target: string; points_to: string | null; on_path: string | null; shadowed: boolean }
+
 export const api = {
   snapshot: () => invoke<Snapshot>("snapshot"),
-  output: (name: string, lines = 600) => invoke<Line[]>("agent_output", { name, lines }),
+  /** `pane`: a herdr agent's pane as it is on screen, not its session's record. */
+  output: (name: string, lines = 600, pane = false) => invoke<Line[]>("agent_output", { name, lines, pane }),
   newAgent: (spec: NewAgent) => invoke<Agent>("new_agent", { spec }),
   createGroup: (spec: NewGroup) => invoke<Agent | null>("create_group", { spec }),
   addLead: (group: string, goal: string, backend: string, harness = "") => invoke<Agent>("add_lead", { group, goal, backend, harness }),
   defaults: () => invoke<Defaults>("defaults"),
-  claudeSessions: () => invoke<ClaudeSession[]>("claude_sessions"),
-  findSession: (id: string) => invoke<ClaudeSession | null>("find_session", { id }),
+  /** Recent saved sessions of a harness (claude or opencode). */
+  sessions: (harness: string) => invoke<ClaudeSession[]>("sessions", { harness }),
+  findSession: (id: string, harness: string) => invoke<ClaudeSession | null>("find_session", { id, harness }),
   plansFolders: () => invoke<PlansFolder[]>("plans_folders"),
   readPrompt: (folder: string, file: string) => invoke<string>("read_prompt", { folder, file }),
   prompt: (name: string, text: string) => invoke<string>("prompt_agent", { name, text }),
@@ -152,6 +156,9 @@ export const api = {
     invoke<PushPreview>("push_preview", { command, cwd, namedCwd }),
   pushGithubMoved: (root: string, branch: string, tracking: string | null) =>
     invoke<boolean | null>("push_github_moved", { root, branch, tracking }),
+  cliStatus: () => invoke<CliStatus>("cli_status"),
+  installCli: () => invoke<string>("install_cli"),
+  cleanupNow: () => invoke<{ archived: [string, string][]; inbox_deleted: number; errors: string[] }>("cleanup_now"),
   configInfo: () => invoke<{ path: string; home: string; text: string; effective: string }>("config_info"),
   saveConfig: (text: string) => invoke<void>("save_config", { text }),
   remoteInfo: () => invoke<RemoteInfo>("remote_info"),

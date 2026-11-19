@@ -457,7 +457,11 @@ fn api(
             "snapshot" => snapshot(&e, st),
             "output" => {
                 let lines = qs("lines").parse().unwrap_or(400).min(5000);
-                Ok(json!(e.output(&qs("name"), lines)?))
+                Ok(json!(e.output_view(
+                    &qs("name"),
+                    lines,
+                    qs("pane") == "1"
+                )?))
             }
             "reports" => {
                 let dir = e.cfg.reports.path();
@@ -505,8 +509,10 @@ fn api(
                         "harness": d.harness,
                         "model": d.model,
                         "codex_model": e.cfg.codex.model,
+                        "opencode_model": e.cfg.opencode.model,
                     },
                     "codex": crate::shell::which(&e.cfg.codex.command),
+                    "opencode": crate::shell::which(&e.cfg.opencode.command),
                 }))
             }
             other => bail!("unknown endpoint {other}"),
@@ -732,6 +738,7 @@ fn kind_label(kind: &str) -> &str {
         "jira" => "Jira draft",
         "handoff" => "Handoff",
         "confluence" => "Confluence",
+        "review" => "PR review",
         other => other,
     }
 }

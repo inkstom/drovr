@@ -9,6 +9,7 @@ pub struct Config {
     pub defaults: Defaults,
     pub claude: Claude,
     pub codex: Codex,
+    pub opencode: OpenCode,
     pub permissions: Permissions,
     pub orchestrator: Orchestrator,
     pub commands: Commands,
@@ -25,8 +26,10 @@ pub struct Config {
     pub remote: Remote,
     pub workflow: Workflow,
     pub watch: Watch,
+    pub review: Review,
     pub stages: Stages,
     pub retro: RetroConfig,
+    pub inbox: Inbox,
 }
 
 /// The retro you start from the timeline or Pipeline.
@@ -66,6 +69,13 @@ pub struct Stages {
     /// Remove stopped stage agents when the last stage's handoff is
     /// approved. Their sessions and the record stay.
     pub tidy_on_close: bool,
+    /// Pair each build agent with a reviewer (`<builder>-review`) that runs
+    /// alongside it in the same folder, can't edit files, and sends the
+    /// builder its findings and proposed diffs. Its model is
+    /// `models.review`.
+    pub review: bool,
+    /// A SKILL.md the reviewers follow; empty, they review on their own.
+    pub review_skill: String,
 }
 
 impl Default for Stages {
@@ -78,6 +88,8 @@ impl Default for Stages {
             build_checkpoint_tokens: 150_000,
             build_checkpoint_usd: 15.0,
             tidy_on_close: true,
+            review: false,
+            review_skill: String::new(),
         }
     }
 }
@@ -92,6 +104,19 @@ impl Stages {
     pub fn model(&self, stage: &str) -> &str {
         self.models.get(stage).map(String::as_str).unwrap_or("")
     }
+}
+
+/// The stage of a build agent's reviewer. It isn't in `stages.order`: it
+/// runs alongside the build stage and never hands off.
+pub const REVIEW: &str = "review";
+
+/// A build agent's reviewer's name: `<builder>-review`, the builder's part
+/// cut so it fits the 40-character limit.
+pub fn reviewer_name(builder: &str) -> String {
+    let suffix = format!("-{REVIEW}");
+    let keep = 40 - suffix.len();
+    let base: String = builder.chars().take(keep).collect();
+    format!("{}{suffix}", base.trim_end_matches(['-', '_']))
 }
 
 /// The ticket workflow, as a whole: the record of each ticket's work and
@@ -137,8 +162,12 @@ pub struct Watch {
 pub struct Rules {
     /// A PR's checks finished and some failed.
     pub ci_failed: String,
+    /// A PR's checks went from pending or failing to passing.
+    pub ci_passed: String,
     /// A reviewer requested changes.
     pub changes_requested: String,
+    /// Green and mergeable with no review decision yet: waiting on a review.
+    pub ready_for_review: String,
     /// A new review or review comments, without a change request.
     pub new_review: String,
     /// The PR has merge conflicts.
@@ -157,7 +186,9 @@ impl Default for Rules {
         let s = |v: &str| v.to_string();
         Rules {
             ci_failed: s("wake"),
+            ci_passed: s("wake"),
             changes_requested: s("wake"),
+            ready_for_review: s("ask"),
             new_review: s("wake"),
             conflict: s("wake"),
             approved_green: s("ask"),
@@ -173,7 +204,9 @@ impl Rules {
     pub fn action(&self, trigger: &str) -> &str {
         match trigger {
             "ci_failed" => &self.ci_failed,
+            "ci_passed" => &self.ci_passed,
             "changes_requested" => &self.changes_requested,
+            "ready_for_review" => &self.ready_for_review,
             "new_review" => &self.new_review,
             "conflict" => &self.conflict,
             "approved_green" => &self.approved_green,
@@ -197,6 +230,49 @@ impl Default for Watch {
             rules: Rules::default(),
             merged_transition: String::new(),
             dispatch_transition: String::new(),
+        }
+    }
+}
+
+/// Finding PRs that need your review: links posted in Slack channels, and
+/// GitHub review requests to your teams. Off until a channel or team is set.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Review {
+    /// Channels to watch for GitHub PR links, e.g. `#sre-reviews`.
+    pub slack_channels: Vec<String>,
+    /// Teams whose review requests to follow, as `org/team`.
+    pub github_teams: Vec<String>,
+    /// How often to look, in seconds; 0 is off.
+    pub poll_secs: u64,
+    /// Start a reviewer without asking.
+    pub auto_dispatch: bool,
+    /// Remove a reviewer once its PR merges or closes.
+    pub remove_when_closed: bool,
+    /// Where local clones live; empty is `defaults.cwd`.
+    pub repos_dir: String,
+    /// Only offer and dispatch PRs in these GitHub owners (orgs or users),
+    /// case-insensitive; empty is any.
+    pub owners: Vec<String>,
+}
+
+impl Review {
+    /// Whether PRs in this owner may be offered and reviewed.
+    pub fn allows(&self, owner: &str) -> bool {
+        self.owners.is_empty() || self.owners.iter().any(|o| o.eq_ignore_ascii_case(owner))
+    }
+}
+
+impl Default for Review {
+    fn default() -> Self {
+        Review {
+            slack_channels: vec![],
+            github_teams: vec![],
+            poll_secs: 600,
+            auto_dispatch: false,
+            remove_when_closed: true,
+            repos_dir: String::new(),
+            owners: vec![],
         }
     }
 }
@@ -316,10 +392,10 @@ impl Default for Remote {
 #[serde(default)]
 pub struct Defaults {
     /// "headless" runs `claude -p` processes drovr owns; "herdr" runs
-    /// interactive Claude Code sessions in herdr panes.
+    /// interactive Claude Code or OpenCode sessions in herdr panes.
     pub backend: String,
-    /// The CLI new agents run with: "claude" (Claude Code) or "codex"
-    /// (experimental, headless only).
+    /// The CLI new agents run with: "claude" (Claude Code), "opencode"
+    /// (OpenCode) or "codex" (experimental, headless only).
     pub harness: String,
     /// Directory new agents and groups start in when none is given.
     pub cwd: String,
@@ -336,6 +412,10 @@ pub struct Defaults {
     /// Tools drovr agents may never use, e.g. ["Artifact"] so reports
     /// stay in drovr instead of being published elsewhere.
     pub disallowed_tools: Vec<String>,
+    /// Files whose contents go into every agent's system prompt, after
+    /// drovr's own instructions (`~` allowed). Edits apply on each agent's
+    /// next run.
+    pub instructions: Vec<String>,
     /// What agents call you ("Notes from Izz", "Izz answered #3"). Empty:
     /// "the human", so a shared config names nobody.
     pub your_name: String,
@@ -375,6 +455,33 @@ impl Default for Codex {
             command: "codex".into(),
             model: String::new(),
             sandbox: "workspace-write".into(),
+            extra_args: vec![],
+        }
+    }
+}
+
+/// OpenCode (`opencode`), for agents started with harness "opencode".
+/// drovr's MCP server, system prompt and permission prompt reach it through
+/// an OpenCode config file and plugin drovr writes for each agent, so your
+/// own `opencode.json` still applies.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OpenCode {
+    pub command: String,
+    /// `provider/model`, e.g. `anthropic/claude-sonnet-5-5`. Empty:
+    /// OpenCode's own default (`model` in its config).
+    pub model: String,
+    /// The OpenCode agent to run as (`--agent`). Empty: its default agent.
+    pub agent: String,
+    pub extra_args: Vec<String>,
+}
+
+impl Default for OpenCode {
+    fn default() -> Self {
+        OpenCode {
+            command: "opencode".into(),
+            model: String::new(),
+            agent: String::new(),
             extra_args: vec![],
         }
     }
@@ -465,14 +572,26 @@ pub struct Source {
 #[serde(default)]
 pub struct Reports {
     pub dir: String,
+    /// Move top-level entries of the plans folder whose newest file is older
+    /// than this many days into `archive/`; 0 never archives.
+    pub archive_after_days: u32,
 }
 
 impl Default for Reports {
     fn default() -> Self {
         Reports {
             dir: "~/.claude/plans".into(),
+            archive_after_days: 0,
         }
     }
+}
+
+/// The Inbox's housekeeping.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Inbox {
+    /// Delete resolved items older than this many days; 0 never deletes.
+    pub keep_days: u32,
 }
 
 /// The terminal panel under an agent's output.
@@ -551,6 +670,7 @@ impl Default for Config {
             defaults: Defaults::default(),
             claude: Claude::default(),
             codex: Codex::default(),
+            opencode: OpenCode::default(),
             permissions: Permissions::default(),
             orchestrator: Orchestrator::default(),
             commands: Commands::default(),
@@ -579,8 +699,10 @@ impl Default for Config {
             memory: Memory::default(),
             workflow: Workflow::default(),
             watch: Watch::default(),
+            review: Review::default(),
             stages: Stages::default(),
             retro: RetroConfig::default(),
+            inbox: Inbox::default(),
         }
     }
 }
@@ -597,6 +719,7 @@ impl Default for Defaults {
             auto_wake: true,
             max_budget_usd: 0.0,
             disallowed_tools: vec![],
+            instructions: vec![],
             auto_resume: false,
             your_name: String::new(),
             cost_warning_usd: 10.0,
@@ -658,7 +781,7 @@ impl Default for Herdr {
             agent_pane: "{herdr} tab create --cwd {cwd} --label {name} --no-focus".into(),
             list: "{herdr} pane list".into(),
             start:
-                "{herdr} agent start {name} --kind claude --pane {pane} --timeout 60000 -- {args}"
+                "{herdr} agent start {name} --kind {kind} --pane {pane} --timeout 60000 -- {args}"
                     .into(),
             run: "{herdr} pane run {pane} {cmd}".into(),
             prompt: "{herdr} agent prompt {target} {text}".into(),
@@ -846,6 +969,28 @@ pub fn personalize(text: &str, you: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::Config;
+
+    #[test]
+    fn names_a_builders_reviewer_within_the_limit() {
+        assert_eq!(super::reviewer_name("g-api"), "g-api-review");
+        let long = "g-a-very-long-builder-name-that-hits-40c";
+        assert_eq!(long.len(), 40);
+        let r = super::reviewer_name(long);
+        assert_eq!(r, "g-a-very-long-builder-name-that-h-review");
+        // A cut that ends on a dash doesn't double it.
+        assert_eq!(
+            super::reviewer_name("g-a-very-long-builder-name-that-x-yyyyyy"),
+            "g-a-very-long-builder-name-that-x-review"
+        );
+        assert_eq!(
+            super::reviewer_name("g-a-very-long-builder-name-that--yyyyyy"),
+            "g-a-very-long-builder-name-that-review"
+        );
+        assert!(r.len() <= 40 && r != long);
+        let off = Config::default();
+        assert!(!off.stages.review);
+        assert!(!off.stages.order.iter().any(|s| s == super::REVIEW));
+    }
 
     #[test]
     fn tests_never_use_the_real_data_folder() {

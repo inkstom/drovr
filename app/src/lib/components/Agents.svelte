@@ -115,17 +115,23 @@
     if (!app.selected && app.snap.agents.length) app.selected = app.snap.agents[0].name;
   });
 
+  // A herdr agent shows its session like a headless one; Pane shows its
+  // pane's screen instead.
+  let paneView = $state(false);
+  const herdrAgent = $derived(current?.backend === "herdr");
+
   // Poll the selected agent's output. Unchanged output isn't re-rendered,
   // since every text line goes through the Markdown renderer.
   $effect(() => {
     const name = app.selected;
+    const pane = paneView;
     lines = [];
     if (!name) return;
     let alive = true;
     let last = "";
     const load = async () => {
       try {
-        const l = await api.output(name, 800);
+        const l = await api.output(name, 800, pane);
         const sig = JSON.stringify(l);
         if (alive && sig !== last) { last = sig; lines = l; }
       } catch {}
@@ -297,7 +303,7 @@
         {#each isCollapsed(g.group) ? [] : g.agents as a}
           <button class="agent" class:sel={a.name === app.selected} class:lead={a.role === "orchestrator"} onclick={() => (app.selected = a.name)}>
             <div class="row">
-              <span class="name grow">{a.role === "orchestrator" ? "★ " : ""}{a.name}</span>
+              <span class="name grow" class:lettered={a.role === "orchestrator"}>{a.role === "orchestrator" ? "★ " : ""}{a.name}</span>
               {#if a.stage}<span class="pill stage" title="Its stage in the ticket workflow">{a.stage}</span>{/if}
               {#if overBudget(a)}<span class="pill cost" title={`Over your cost warning of $${costCap} (defaults.cost_warning_usd)`}>${a.cost_usd.toFixed(2)}</span>{/if}
               <span class="pill s-{a.state}">{a.state}</span>
@@ -315,7 +321,7 @@
     {#if current}
       <header>
         <div class="row">
-          <h2 class="grow">{current.name}</h2>
+          <h2 class="grow lettered">{current.name}</h2>
           <span class="pill s-{current.state}">{current.state}</span>
           {#if current.state === "working"}
             <button class="danger" onclick={() => act(() => api.stop(current.name), "Stopped")}>Stop</button>
@@ -327,6 +333,9 @@
             <button onclick={openInHerdr} title="Continue this agent's conversation in a new herdr pane, or show the pane it's already running in">Open in herdr</button>
           {/if}
           <button class="ghost" onclick={copyAttach} title="Copy a command that continues this conversation in any terminal">Copy cmd</button>
+          {#if herdrAgent}
+            <button class:on={paneView} onclick={() => (paneView = !paneView)} title="Show its herdr pane's screen instead of the session">Pane</button>
+          {/if}
           <button onclick={() => { app.view = "review"; }}>Review</button>
           {#if currentTickets.length}
             <button onclick={() => (app.timeline = currentTickets[0])} title={`Everything that happened on ${currentTickets.join(", ")}, for review and the retro`}>Timeline</button>
@@ -337,7 +346,7 @@
         </div>
         <div class="meta muted">
           <span>{current.role}{current.stage ? ` · ${current.stage} stage` : ""}{current.model ? ` · ${current.model}` : ""}</span>
-          <span>{current.harness === "codex" ? "Codex · " : ""}{current.backend}{current.pane ? ` · ${current.pane}` : ""}</span>
+          <span>{current.harness === "codex" ? "Codex · " : current.harness === "opencode" ? "OpenCode · " : ""}{current.backend}{current.pane ? ` · ${current.pane}` : ""}</span>
           {#if current.ticket}<span>{current.ticket}</span>{/if}
           <span title={current.cwd}>{current.cwd.replace(/^.*\/(.+\/.+)$/, "…/$1")}</span>
           <span class:cost={overBudget(current)} title={overBudget(current) ? `Over your cost warning of $${costCap} (defaults.cost_warning_usd)` : "What its headless runs cost, at API list prices"}>{current.runs} runs · ${current.cost_usd.toFixed(2)}{overBudget(current) ? " ⚠" : ""}</span>
@@ -360,13 +369,14 @@
       <div class="log scroll" bind:this={logEl} onscroll={() => logEl && (follow = logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 40)}>
         {#each lines as l, i}
           <div class="line" data-i={i} class:hit={hits.includes(i)} class:at={i === hitLine}>
-          {#if l.kind === "run"}<div class="sep">{l.text}</div>
+          {#if l.kind === "run"}<div class="sep lettered">{l.text}</div>
           {:else if l.kind === "prompt"}<div class="prompt"><div class="md">{@html md(l.text)}</div></div>
           {:else if l.kind === "text"}<div class="text md">{@html md(l.text)}</div>
           {:else if l.kind === "tool"}<div class="tool"><span>⏵</span> {l.text}</div>
           {:else if l.kind === "result"}<details class="result" open={hits.includes(i)}><summary>{l.text.split("\n")[0].slice(0, 140) || "(no output)"}</summary><pre>{l.text}</pre></details>
           {:else if l.kind === "final"}<div class="final">{l.text}</div>
           {:else if l.kind === "error"}<pre class="err">{l.text}</pre>
+          {:else if l.kind === "waiting"}<div class="waiting"><span>{l.text}</span> <button onclick={app.snap.herdr ? openInHerdr : copyAttach}>{app.snap.herdr ? "Open in herdr" : "Copy cmd"}</button></div>
           {:else}<pre class="raw">{l.text}</pre>{/if}
           </div>
         {:else}
@@ -430,16 +440,20 @@
   h2 { margin: 0; font-size: 16px; }
   .meta { display: flex; flex-wrap: wrap; gap: 14px; font-size: 12px; margin-top: 4px; }
   .needs { margin-top: 8px; border-color: var(--yellow); color: var(--yellow); background: transparent; }
-  .log { flex: 1; padding: 12px 16px; min-height: 0; }
+  .log { flex: 1; padding: 12px 16px; min-height: 0; overflow-x: hidden; }
   .sep { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; border-top: 1px dashed var(--border); margin: 14px 0 6px; padding-top: 6px; }
   .prompt { border-left: 3px solid var(--purple); padding: 4px 10px; background: var(--panel); border-radius: 4px; margin: 6px 0; }
   .text { margin: 6px 0; }
+  /* Gold themes: drovr's message bar and tool lines in the accent gold. */
+  :global([data-foil]) .prompt { border-left-color: var(--accent); }
+  :global([data-foil]) .tool { color: var(--accent); }
   .tool { font-family: var(--mono); font-size: 12px; color: var(--cyan); margin: 2px 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .result { font-size: 12px; color: var(--muted); margin: 0 0 4px 16px; }
   .result summary { cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-family: var(--mono); }
   .result pre { white-space: pre-wrap; max-height: 300px; overflow: auto; background: var(--panel); padding: 6px; border-radius: 4px; }
   .final { color: var(--green); font-size: 12px; margin: 6px 0; }
   .err { color: var(--red); white-space: pre-wrap; }
+  .waiting { color: var(--yellow); margin: 8px 0; display: flex; align-items: center; gap: 10px; }
   .raw { margin: 0; white-space: pre-wrap; }
   .queue { border-top: 1px solid var(--border); padding: 6px 16px 0; display: flex; flex-direction: column; gap: 4px; max-height: 30%; overflow: auto; }
   .queued { display: flex; align-items: flex-start; gap: 8px; padding: 6px 8px; background: var(--panel); border: 1px dashed var(--border); border-radius: 6px; font-size: 13px; }

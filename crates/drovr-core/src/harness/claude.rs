@@ -1,7 +1,7 @@
 //! Claude Code (`claude`): drovr's permission prompt, cost tracking, herdr
 //! panes, forking and adopting existing sessions.
 
-use super::{line, Costs, Event, Harness, Live, Run, Session};
+use super::{line, Costs, Event, Harness, Live, Run, Session, Transcript};
 use crate::config::Config;
 use crate::engine::truncate;
 use crate::sessions::SavedSession;
@@ -90,7 +90,7 @@ impl Harness for Claude {
         })
     }
 
-    fn parse(&self, v: &Value) -> Event {
+    fn parse(&self, v: &Value, _run: &mut Value) -> Event {
         claude_event(v)
     }
 
@@ -113,6 +113,27 @@ impl Harness for Claude {
                 n("input_tokens") + n("cache_read_input_tokens") + n("cache_creation_input_tokens")
             })
         })
+    }
+
+    /// An interactive session's transcript: the same messages as a
+    /// headless run's log, plus the prompts typed into it.
+    fn transcript(&self, cfg: &Config, id: &str) -> Option<Transcript> {
+        let _ = cfg;
+        self.session_file(id).map(Transcript::File)
+    }
+
+    fn parse_transcript(&self, v: &Value, run: &mut Value) -> Event {
+        // A subagent's messages, and what Claude Code adds for itself
+        // (command output, reminders), aren't the conversation.
+        if v["isSidechain"] == true || v["isMeta"] == true {
+            return Event::Skip;
+        }
+        if v["type"] == "user" {
+            if let Some(text) = typed_prompt(&v["message"]["content"]) {
+                return Event::Lines(vec![line("prompt", text)]);
+            }
+        }
+        self.parse(v, run)
     }
 
     fn session_file(&self, id: &str) -> Option<PathBuf> {
@@ -156,9 +177,13 @@ fn claude_common(run: &Run) -> Vec<String> {
     if !model.is_empty() {
         args.extend(["--model".into(), model]);
     }
-    if !cfg.defaults.disallowed_tools.is_empty() {
+    let disallowed = super::disallowed(cfg, run.agent);
+    if !disallowed.is_empty() {
         args.push("--disallowedTools".into());
-        args.push(cfg.defaults.disallowed_tools.join(","));
+        args.push(disallowed.join(","));
+    }
+    if super::untrusted_workspace(run.agent) {
+        args.extend(["--setting-sources".into(), "user".into()]);
     }
     if let Some(settings) = crate::memory::settings(cfg, run.agent) {
         args.extend(["--settings".into(), settings]);
@@ -194,6 +219,24 @@ fn add_status_line(args: &mut Vec<String>, run: &Run) -> Result<()> {
         run.settings_file.display().to_string(),
     ]);
     Ok(())
+}
+
+/// A prompt someone typed, from a transcript's user message: its text, as
+/// a string or text blocks. Tool results and Claude Code's own messages
+/// (`<command-name>…`, `<local-command-stdout>…`) aren't.
+fn typed_prompt(content: &Value) -> Option<String> {
+    let text = match content {
+        Value::String(s) => s.clone(),
+        Value::Array(parts) if parts.iter().all(|p| p["type"] == "text") => parts
+            .iter()
+            .filter_map(|p| p["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => return None,
+    };
+    let t = text.trim();
+    (!t.is_empty() && !t.starts_with("<command-") && !t.starts_with("<local-command"))
+        .then(|| t.to_string())
 }
 
 /// Claude Code's `--output-format stream-json`.
@@ -325,6 +368,7 @@ mod tests {
                 cli: "/opt/drovr".into(),
                 home: "/data/drovr".into(),
                 mcp_config: "/m.json".into(),
+                dir: "/agent".into(),
                 system_prompt: "/s.md".into(),
                 settings_file: "/settings.json".into(),
                 session: Session::New,
@@ -337,6 +381,33 @@ mod tests {
         let s: Value = serde_json::from_str(&args[at + 1]).unwrap();
         assert_eq!(s["autoMemoryDirectory"], "/m/memory");
         assert_eq!(s["permissions"]["deny"], json!(["Edit(//m/memory/**)"]));
+    }
+
+    #[test]
+    fn a_pr_reviewer_keeps_to_user_settings() {
+        let cfg = Config::default();
+        let args = |role: &str| {
+            let a = Agent {
+                role: role.into(),
+                ..agent("s1")
+            };
+            claude_common(&Run {
+                cfg: &cfg,
+                agent: &a,
+                cli: "/opt/drovr".into(),
+                home: "/data/drovr".into(),
+                mcp_config: "/m.json".into(),
+                dir: "/agent".into(),
+                system_prompt: "/s.md".into(),
+                settings_file: "/settings.json".into(),
+                session: Session::New,
+            })
+        };
+        let at = |v: &[String]| v.iter().position(|a| a == "--setting-sources");
+        let reviewer = args("pr-reviewer");
+        assert_eq!(reviewer[at(&reviewer).unwrap() + 1], "user");
+        assert!(at(&args("worker")).is_none());
+        assert!(!args("pr-reviewer").contains(&"--strict-mcp-config".to_string()));
     }
 
     #[test]
@@ -414,17 +485,69 @@ mod tests {
     }
 
     #[test]
+    fn reads_an_interactive_transcript() {
+        let parse =
+            |s: &str| Claude.parse_transcript(&serde_json::from_str(s).unwrap(), &mut Value::Null);
+        // Lines as Claude Code writes them to ~/.claude/projects.
+        assert_eq!(
+            parse(
+                r#"{"type":"user","parentUuid":null,"sessionId":"s1","message":{"role":"user","content":"Fix the login bug"}}"#
+            ),
+            Event::Lines(vec![line("prompt", "Fix the login bug".into())])
+        );
+        assert_eq!(
+            parse(
+                r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"and add a test"}]}}"#
+            ),
+            Event::Lines(vec![line("prompt", "and add a test".into())])
+        );
+        let Event::Lines(l) = parse(
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}"#,
+        ) else {
+            panic!()
+        };
+        assert_eq!((l[0].kind.as_str(), l[0].text.as_str()), ("result", "ok"));
+        let Event::Lines(l) =
+            parse(r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Done."}]}}"#)
+        else {
+            panic!()
+        };
+        assert_eq!(l[0].text, "Done.");
+        assert_eq!(
+            parse(
+                r#"{"type":"assistant","isSidechain":true,"message":{"content":[{"type":"text","text":"subagent"}]}}"#
+            ),
+            Event::Skip
+        );
+        assert_eq!(
+            parse(r#"{"type":"ai-title","title":"Login bug"}"#),
+            Event::Skip
+        );
+        assert_eq!(
+            parse(r#"{"type":"user","isMeta":true,"message":{"content":"Caveat"}}"#),
+            Event::Skip
+        );
+        assert_eq!(
+            parse(r#"{"type":"user","message":{"content":"<command-name>/clear</command-name>"}}"#),
+            Event::Lines(vec![])
+        );
+    }
+
+    #[test]
     fn reads_claude_events() {
         let v: Value = serde_json::from_str(
             r#"{"type":"assistant","message":{"content":[{"type":"text","text":"hi"},{"type":"tool_use","name":"Bash","input":{"command":"ls"}}]}}"#,
         )
         .unwrap();
-        let Event::Lines(l) = Claude.parse(&v) else {
+        let Event::Lines(l) = Claude.parse(&v, &mut Value::Null) else {
             panic!()
         };
         assert_eq!((l[0].text.as_str(), l[1].text.as_str()), ("hi", "Bash ls"));
         assert_eq!(
-            Claude.parse(&json!({"type":"system","subtype":"init","session_id":"s9"})),
+            Claude.parse(
+                &json!({"type":"system","subtype":"init","session_id":"s9"}),
+                &mut Value::Null
+            ),
             Event::Session("s9".into())
         );
     }

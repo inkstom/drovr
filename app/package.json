@@ -1,7 +1,7 @@
 {
   "name": "drovr-app",
-  "version": "0.11.3",
-  "description": "",
+  "version": "0.15.1",
+  "description": "Lightweight Rust desktop control plane for orchestrating, monitoring, and sharing context across Claude Code, OpenCode, and OpenAI Codex agents.",
   "type": "module",
   "imports": {
     "#lib": "./src/lib",

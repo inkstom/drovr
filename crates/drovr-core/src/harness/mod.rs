@@ -7,9 +7,11 @@
 
 mod claude;
 mod codex;
+pub mod opencode;
 
 pub use claude::Claude;
 pub use codex::Codex;
+pub use opencode::OpenCode;
 
 use crate::config::Config;
 use crate::engine::Line;
@@ -24,10 +26,12 @@ use std::path::PathBuf;
 pub static CLAUDE: Claude = Claude;
 /// OpenAI's Codex CLI (experimental).
 pub static CODEX: Codex = Codex;
+/// OpenCode.
+pub static OPENCODE: OpenCode = OpenCode;
 
 /// Every harness, the default first.
-pub fn all() -> [&'static dyn Harness; 2] {
-    [&CLAUDE, &CODEX]
+pub fn all() -> [&'static dyn Harness; 3] {
+    [&CLAUDE, &CODEX, &OPENCODE]
 }
 
 /// A harness by name; empty means the default (Claude Code).
@@ -38,8 +42,36 @@ pub fn named(name: &str) -> Result<&'static dyn Harness> {
     }
     match all().into_iter().find(|h| h.name() == name) {
         Some(h) => Ok(h),
-        None => bail!("unknown harness {name:?}: use claude or codex"),
+        None => bail!("unknown harness {name:?}: use claude, codex or opencode"),
     }
+}
+
+/// The tools that change files, which a build agent's reviewer can't use.
+pub const EDIT_TOOLS: &[&str] = &["Edit", "Write", "MultiEdit", "NotebookEdit"];
+
+/// Whether the agent works next to code it hasn't reviewed (a PR reviewer),
+/// so its CLI shouldn't load project-level config from there.
+pub fn untrusted_workspace(agent: &Agent) -> bool {
+    agent.role == "pr-reviewer"
+}
+
+/// Whether the agent is a build agent's reviewer, which only reads.
+pub fn read_only(agent: &Agent) -> bool {
+    agent.stage == crate::config::REVIEW
+}
+
+/// The tools an agent can't use: `defaults.disallowed_tools`, and for a
+/// reviewer, the ones that change files.
+pub fn disallowed(cfg: &Config, agent: &Agent) -> Vec<String> {
+    let mut tools = cfg.defaults.disallowed_tools.clone();
+    if read_only(agent) {
+        for t in EDIT_TOOLS {
+            if !tools.iter().any(|x| x == t) {
+                tools.push(t.to_string());
+            }
+        }
+    }
+    tools
 }
 
 /// The model an agent runs on: its own (a stage's, or one you chose), else
@@ -60,7 +92,7 @@ pub fn of(agent: &Agent) -> &'static dyn Harness {
 
 /// One coding-agent CLI.
 pub trait Harness: Sync {
-    /// Its name in the config and the database: `claude`, `codex`.
+    /// Its name in the config and the database: `claude`, `codex`, `opencode`.
     fn name(&self) -> &'static str;
 
     /// The CLI to run, from the config.
@@ -78,6 +110,12 @@ pub trait Harness: Sync {
     /// Arguments for a headless run, which reads its prompt from stdin and
     /// writes JSON lines to stdout.
     fn headless_args(&self, run: &Run) -> Result<Vec<String>>;
+
+    /// Environment variables a headless run needs on top of drovr's own.
+    fn headless_env(&self, run: &Run) -> Result<Vec<(String, String)>> {
+        let _ = run;
+        Ok(vec![])
+    }
 
     /// Whether agents can run in herdr panes.
     fn runs_in_herdr(&self) -> bool {
@@ -100,10 +138,53 @@ pub trait Harness: Sync {
         )
     }
 
+    /// The agent kind herdr knows it by (`herdr agent start --kind`).
+    fn herdr_kind(&self) -> &'static str {
+        self.name()
+    }
+
+    /// Environment variables the agent's pane needs before it starts; drovr
+    /// exports them in the pane's shell, which herdr starts the agent from.
+    fn herdr_env(&self, run: &Run) -> Result<Vec<(String, String)>> {
+        let _ = run;
+        Ok(vec![])
+    }
+
+    /// An interactive session's running figures, read from the CLI's own
+    /// records, for CLIs with no status line to report them.
+    fn session_live(&self, cfg: &Config, id: &str) -> Option<Live> {
+        let _ = (cfg, id);
+        None
+    }
+
+    /// Where an interactive session's record is, so a herdr agent's output
+    /// shows as a headless one's does. None when the CLI keeps none drovr
+    /// can read (or the session hasn't started): the pane is shown instead.
+    fn transcript(&self, cfg: &Config, id: &str) -> Option<Transcript> {
+        let _ = (cfg, id);
+        None
+    }
+
+    /// What one entry of a session's record (`transcript`) means. Prompts
+    /// you typed are `prompt` lines.
+    fn parse_transcript(&self, event: &Value, run: &mut Value) -> Event {
+        self.parse(event, run)
+    }
+
+    /// The newest session started in `cwd` since `since` (Unix seconds),
+    /// for CLIs that name their sessions themselves: how drovr learns the
+    /// session of an agent it started in a herdr pane.
+    fn latest_session(&self, cfg: &Config, cwd: &str, since: f64) -> Option<String> {
+        let _ = (cfg, cwd, since);
+        None
+    }
+
     // -- reading a run --------------------------------------------------------
 
-    /// What one line of a run log means.
-    fn parse(&self, event: &Value) -> Event;
+    /// What one line of a run log means. `run` is what the harness kept
+    /// from the earlier lines of the same run (null at its first line), for
+    /// CLIs that report a run's figures piece by piece.
+    fn parse(&self, event: &Value, run: &mut Value) -> Event;
 
     /// What the run that ended with `end` (an `Event::End`) cost, in US
     /// dollars, or None when the CLI doesn't report a cost. `costs` carries
@@ -154,6 +235,15 @@ pub trait Harness: Sync {
     fn label(&self) -> &'static str;
 }
 
+/// An interactive session's record.
+pub enum Transcript {
+    /// A file that only grows, read as JSON lines (Claude Code's).
+    File(PathBuf),
+    /// The whole record so far, as JSON events (OpenCode's, from its
+    /// database).
+    Events(Vec<Value>),
+}
+
 /// Whether a run starts a session, continues the agent's, or continues a
 /// copy of it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -173,6 +263,9 @@ pub struct Run<'a> {
     pub home: PathBuf,
     /// The MCP config file drovr wrote for the agent (Claude Code reads it).
     pub mcp_config: PathBuf,
+    /// The agent's own folder, where a harness can write the files its CLI
+    /// reads (OpenCode's config and plugin).
+    pub dir: PathBuf,
     /// The system prompt drovr wrote for the agent.
     pub system_prompt: PathBuf,
     /// Where a herdr start's Claude Code settings go.
@@ -266,6 +359,7 @@ pub(crate) mod testing {
             cli: "/opt/drovr".into(),
             home: "/data/drovr".into(),
             mcp_config: "/data/drovr/agents/api/mcp.json".into(),
+            dir: dir.join(format!("agent-{n}")),
             system_prompt: system,
             settings_file: dir.join(format!("settings-{n}.json")),
             session,
@@ -277,11 +371,77 @@ pub(crate) mod testing {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::harness::testing::{agent, with};
+
+    #[test]
+    fn a_reviewer_cant_change_files_in_any_harness() {
+        let reviewer = Agent {
+            stage: crate::config::REVIEW.into(),
+            ..agent("s1")
+        };
+        let builder = Agent {
+            stage: "build".into(),
+            ..agent("s1")
+        };
+        let flag = |args: &[String], name: &str| {
+            args.iter()
+                .position(|a| a == name)
+                .map(|i| args[i + 1].clone())
+        };
+        let claude = |a: &Agent| {
+            with(a, Session::New, |r| {
+                named("claude").unwrap().headless_args(r).unwrap()
+            })
+        };
+        assert_eq!(
+            flag(&claude(&reviewer), "--disallowedTools").as_deref(),
+            Some("Edit,Write,MultiEdit,NotebookEdit")
+        );
+        assert_eq!(flag(&claude(&builder), "--disallowedTools"), None);
+        let codex = |a: &Agent| {
+            with(a, Session::New, |r| {
+                named("codex").unwrap().headless_args(r).unwrap()
+            })
+        };
+        assert_eq!(flag(&codex(&reviewer), "-s").as_deref(), Some("read-only"));
+        assert_eq!(
+            flag(&codex(&builder), "-s").as_deref(),
+            Some("workspace-write")
+        );
+        let opencode = |a: &Agent| {
+            with(a, Session::New, |r| {
+                let env = named("opencode").unwrap().headless_env(r).unwrap();
+                let text = std::fs::read_to_string(&env[0].1).unwrap();
+                serde_json::from_str::<Value>(&text).unwrap()
+            })
+        };
+        assert_eq!(
+            opencode(&reviewer)["permissions"],
+            serde_json::json!([{ "action": "edit", "resource": "*", "effect": "deny" }])
+        );
+        assert!(opencode(&builder).get("permissions").is_none());
+    }
+
+    #[test]
+    fn a_reviewers_disallowed_tools_add_to_yours() {
+        let mut cfg = Config::default();
+        cfg.defaults.disallowed_tools = vec!["WebFetch".into(), "Write".into()];
+        let reviewer = Agent {
+            stage: crate::config::REVIEW.into(),
+            ..agent("s1")
+        };
+        assert_eq!(
+            disallowed(&cfg, &reviewer),
+            ["WebFetch", "Write", "Edit", "MultiEdit", "NotebookEdit"]
+        );
+        assert_eq!(disallowed(&cfg, &agent("s1")), ["WebFetch", "Write"]);
+    }
 
     #[test]
     fn finds_harnesses_by_name() {
         assert_eq!(named("").unwrap().name(), "claude");
         assert_eq!(named("codex").unwrap().name(), "codex");
+        assert_eq!(named("opencode").unwrap().name(), "opencode");
         assert!(named("gemini").is_err());
         let old = Agent::default();
         assert_eq!(of(&old).name(), "claude");

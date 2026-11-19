@@ -2,7 +2,7 @@
   import { onMount } from "svelte";
   import { api } from "#lib/api.ts";
   import { listen } from "@tauri-apps/api/event";
-  import { app, refresh, type View } from "#lib/state.svelte.ts";
+  import { app, act, toast, refresh, type View } from "#lib/state.svelte.ts";
   import { initTheme } from "#lib/theme.svelte.ts";
   import Tooltip from "#lib/components/Tooltip.svelte";
   import Agents from "#lib/components/Agents.svelte";
@@ -46,6 +46,7 @@
       if (app.view !== "agents") { app.view = "agents"; app.termOpen = true; }
       else app.termOpen = !app.termOpen;
     });
+    const offCli = listen("menu:menu-install-cli", () => { act(() => api.installCli()).then((m) => m && toast(m)); });
     refresh();
     api.defaults().then((d) => { app.you = d.your_name; app.defaults = d; }).catch(() => {});
     const offKeys = listen("menu:menu-view-shortcuts", () => (app.shortcutsOpen = true));
@@ -61,13 +62,13 @@
       if (e.key === "/") { app.shortcutsOpen = true; e.preventDefault(); }
     };
     window.addEventListener("keydown", onKey);
-    return () => { stopTheme(); offFind.then((f) => f()); offTerm.then((f) => f()); offKeys.then((f) => f()); clearInterval(t); window.removeEventListener("keydown", onKey); };
+    return () => { stopTheme(); offFind.then((f) => f()); offTerm.then((f) => f()); offKeys.then((f) => f()); offCli.then((f) => f()); clearInterval(t); window.removeEventListener("keydown", onKey); };
   });
 </script>
 
 <div class="shell">
   <aside>
-    <div class="brand"><img src="/drovr.svg" alt="" width="22" height="22" />drovr</div>
+    <div class="brand"><img src="/drovr.svg" alt="" width="22" height="22" /><span class="lettered">drovr</span></div>
     <nav>
       {#each nav as n}
         <button class="nav" class:active={app.view === n.id} aria-current={app.view === n.id ? "page" : undefined} onclick={() => (app.view = n.id)} title={n.key ? `${n.tip} (${mod}${n.key})` : n.tip}>

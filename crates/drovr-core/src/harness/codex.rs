@@ -50,7 +50,7 @@ impl Harness for Codex {
         Ok(args)
     }
 
-    fn parse(&self, v: &Value) -> Event {
+    fn parse(&self, v: &Value, _run: &mut Value) -> Event {
         codex_event(v)
     }
 
@@ -107,7 +107,12 @@ fn codex_common(run: &Run) -> Result<Vec<String>> {
     ] {
         args.extend(["-c".into(), format!("{key}={value}")]);
     }
-    args.extend(["-s".into(), cfg.codex.sandbox.clone()]);
+    let sandbox = if super::read_only(run.agent) {
+        "read-only".to_string()
+    } else {
+        cfg.codex.sandbox.clone()
+    };
+    args.extend(["-s".into(), sandbox]);
     let model = super::model_of(&Codex, run.agent, cfg);
     if !model.is_empty() {
         args.extend(["-m".into(), model]);
@@ -247,7 +252,7 @@ mod tests {
 
     #[test]
     fn reads_codex_events() {
-        let parse = |s: &str| Codex.parse(&serde_json::from_str(s).unwrap());
+        let parse = |s: &str| Codex.parse(&serde_json::from_str(s).unwrap(), &mut Value::Null);
         // Real `codex exec --json` output (0.164.0).
         assert_eq!(
             parse(

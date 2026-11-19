@@ -339,7 +339,7 @@ drovr's watcher keeps it current without an agent, so it spends no tokens:
 
 - **Jira:** every `watch.jira_poll_secs` (5 minutes) it runs the `watch.jql` query (by default your open sprint) through the Jira `command` provider (twg) or `rest`. It reads a ticket in full, with its comments, only when its `updated` time moved.
 - **Pull requests:** every `watch.pr_poll_secs` (2 minutes, or 1 while checks run) it searches `watch.github_repos` with `gh` for PRs whose title has one of those ticket keys (`owner/repo`, or `owner/*` for all of an owner's repos), and looks closer at PRs that changed or whose checks are still running.
-- **Into the record:** status moves, new comments, tickets joining or leaving the sprint, PRs linked, CI passing or failing, reviews, conflicts, merges and closes go to each ticket's record (for tickets an agent or group is on). The first read only takes a baseline. After that, an open PR the watcher hasn't seen before (a new one, or one whose ticket just came into view) counts as changed from nothing: reviews, failing checks or a conflict already on it, draft or not, go through `watch.rules` once.
+- **Into the record:** status moves, new comments, tickets joining or leaving the sprint, PRs linked, CI passing or failing, reviews, conflicts, merges and closes go to each ticket's record (for tickets an agent or group is on). The first read only takes a baseline. After that, an open PR the watcher hasn't seen before (a new one, or one whose ticket just came into view) counts as changed from nothing: reviews, failing checks, a conflict, or being green and waiting on review already on it, draft or not, go through `watch.rules` once.
 - **While the app is closed** nothing is read. drovr keeps what it last saw in `watch.json` in its data folder, so the first read after you open the app records what changed meanwhile.
 - **Refresh now** reads both at once. Errors (a missing `gh`, `twg` needing `twg login`, a search command whose JSON has no issue keys) show at the top. The search command can print a list of issues, Jira's `{"issues": […]}`, or either inside twg's `-o json` envelope (`"data"`).
 
@@ -364,15 +364,17 @@ For each change, `watch.rules` says whether to **wake** the agent that owns the 
 | Rule | When | Default | What the agent gets |
 | --- | --- | --- | --- |
 | `ci_failed` | A PR's checks have all finished and some failed | wake | The failing checks and the end of the failing GitHub Actions log (`gh run view --log-failed`, last 150 lines) |
+| `ci_passed` | Its checks went from pending or failing to passing | wake | CI passed and a nudge to carry on |
 | `changes_requested` | A reviewer requested changes | wake | The latest reviews and inline review comments (file:line) |
-| `new_review` | A new review without a change request | wake | The same |
+| `new_review` | Each new review without a change request (fires for every review, not once per commit) | wake | The same |
+| `ready_for_review` | Green, mergeable, no review decision yet; once per commit | ask | A "waiting on review" item for you |
 | `conflict` | The PR has merge conflicts | wake | What to do: merge the base in, resolve, push |
 | `approved_green` | Approved, checks green, no conflicts | ask | A "ready to merge" item for you |
 | `merged` | The PR merged | ask | An item for you, plus Jira drafts (below). Sent on, the agent is asked to wrap up: what's left, and what you should know |
 | `pr_closed` | Closed without merging | ask | An item for you |
 | `jira_changed` | The ticket's status, assignee or comments changed, or it left the sprint | ask | An item for you |
 
-- **Once per head:** a rule fires once per PR head commit, so a failure that stays failed doesn't wake the agent again until it pushes.
+- **Once per head:** a rule fires once per PR head commit (`new_review` once per review), so a failure that stays failed doesn't wake the agent again until it pushes.
 - **Busy agents:** if the agent is working, the wake waits as a queued message (with **Send now**).
 - **Asked instead:** a stopped agent, or a ticket nobody's on, is asked about instead of woken.
 - **Watcher items:** in the Inbox they say what changed, with the details, and what **Send to <agent>** would ask the agent to do. Sending passes all of it on.
@@ -665,7 +667,7 @@ drovr reads `~/.config/drovr/config.toml`. Every key is optional, and [`config.e
 | `watch.jira_poll_secs` | `300` | How often the watcher reads Jira |
 | `watch.pr_poll_secs` | `120` | How often it reads PRs (at most 60 while checks run) |
 | `watch.gh` | `"gh"` | The GitHub CLI |
-| `watch.rules.<rule>` | see [the table](#what-the-watcher-does-about-a-change) | `wake`, `ask` or `ignore` for `ci_failed`, `changes_requested`, `new_review`, `conflict`, `approved_green`, `merged`, `pr_closed`, `jira_changed` |
+| `watch.rules.<rule>` | see [the table](#what-the-watcher-does-about-a-change) | `wake`, `ask` or `ignore` for `ci_failed`, `ci_passed`, `changes_requested`, `new_review`, `ready_for_review`, `conflict`, `approved_green`, `merged`, `pr_closed`, `jira_changed` |
 | `watch.merged_transition` | `""` | When a ticket's PR merges, also draft moving the ticket with this transition (twg: its id) |
 | `watch.dispatch_transition` | `""` | When you dispatch a ticket, move it with this transition straight away (twg: the id of the move to In Progress) |
 | `jira.comment_cmd`, `jira.transition_cmd` | `""` | How drovr posts Jira drafts you approve (see [Jira drafts](#jira-drafts)) |

@@ -390,6 +390,76 @@ fn remove_worktree(dir: &Path, name: &str) -> String {
     }
 }
 
+/// Remove a PR reviewer's folder: its `pr` worktree and branch, uncommitted
+/// files and all, then the folder around them. It never holds work worth
+/// keeping.
+fn remove_pr_worktree(dir: &Path, name: &str) -> String {
+    let pr = dir.join("pr");
+    if let Some(main) = git_common_dir(&pr).and_then(|c| c.parent().map(Path::to_path_buf)) {
+        let _ = git_in(
+            &main,
+            &format!(
+                "worktree remove --force {}",
+                quote(&pr.display().to_string())
+            ),
+        );
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = git_in(
+            &main,
+            &format!("branch -D {}", quote(&format!("drovr/{name}"))),
+        );
+        let _ = git_in(&main, "worktree prune");
+    } else {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    "Its worktree and branch were removed.".into()
+}
+
+/// Whether a git remote URL (https or ssh) points at GitHub's `owner/repo`.
+pub(crate) fn remote_is(url: &str, owner: &str, repo: &str) -> bool {
+    let url = url.trim().to_lowercase();
+    let url = url.strip_suffix(".git").unwrap_or(&url);
+    let Some(i) = url.find("github.com") else {
+        return false;
+    };
+    let rest = &url[i + "github.com".len()..];
+    let Some(path) = rest.strip_prefix('/').or_else(|| rest.strip_prefix(':')) else {
+        return false;
+    };
+    path.trim_end_matches('/') == format!("{}/{}", owner.to_lowercase(), repo.to_lowercase())
+}
+
+/// The clone's first remote that points at `owner/repo`. The clone must be
+/// a repo of its own, not a folder inside another one. Remote URLs are read
+/// from the config as written, before any `insteadOf` rewriting.
+fn pr_remote(clone: &Path, owner: &str, repo: &str) -> Result<String> {
+    let top = git_in(clone, "rev-parse --show-toplevel")?;
+    let same = top.ok()
+        && std::fs::canonicalize(top.stdout.trim()).ok() == std::fs::canonicalize(clone).ok();
+    if !same {
+        bail!(
+            "{} isn't a git clone; remove it or set review.repos_dir",
+            clone.display()
+        );
+    }
+    let out = git_in(clone, "config --get-regexp '^remote\\..*\\.url$'")?;
+    for line in out.stdout.lines() {
+        let Some((key, url)) = line.split_once(' ') else {
+            continue;
+        };
+        let name = key
+            .strip_prefix("remote.")
+            .and_then(|k| k.strip_suffix(".url"));
+        if let Some(name) = name.filter(|_| remote_is(url, owner, repo)) {
+            return Ok(name.to_string());
+        }
+    }
+    bail!(
+        "{} has no remote for {owner}/{repo}; add one or set review.repos_dir",
+        clone.display()
+    )
+}
+
 /// A worker's name: `<group>-<name>`, cut to fit the 40-character limit.
 fn worker_name(group: &str, name: &str) -> String {
     let base = slug(name);
@@ -711,6 +781,7 @@ impl Engine {
             && resumed.is_none()
             && spec.stage != "retro"
             && spec.stage != crate::config::REVIEW
+            && spec.role != "pr-reviewer"
         {
             cwd = self.make_worktree(&cwd, &spec.name)?;
         }
@@ -837,6 +908,138 @@ impl Engine {
             stage: crate::config::REVIEW.into(),
             ..NewAgent::default()
         })
+    }
+
+    /// Start a reviewer for a PR: a solo agent in its own worktree at the
+    /// PR's head commit, in the local clone (cloned first if it's missing).
+    pub fn dispatch_review(&self, url: &str) -> Result<Agent> {
+        static DISPATCH: Mutex<()> = Mutex::new(());
+        let (owner, repo, number) = crate::pr_review::parse(url).ok_or_else(|| {
+            anyhow!("{url} isn't a GitHub PR link like https://github.com/o/r/pull/1")
+        })?;
+        let url = &format!("https://github.com/{owner}/{repo}/pull/{number}");
+        for part in [&owner, &repo] {
+            let plain = part
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+            if part.is_empty() || !plain || part.starts_with(['-', '.']) {
+                bail!("{url} has an owner or repo name drovr won't use as a folder");
+            }
+        }
+        if !self.cfg.review.allows(&owner) {
+            bail!("{owner} isn't in review.owners, so drovr won't review {url}");
+        }
+        let _one = DISPATCH.lock().unwrap_or_else(|e| e.into_inner());
+        let repos = match self.cfg.review.repos_dir.trim() {
+            "" => PathBuf::from(self.cfg.default_cwd()),
+            dir => PathBuf::from(expand_tilde(dir)),
+        };
+        let clone = repos.join(&repo);
+        if !clone.is_dir() {
+            std::fs::create_dir_all(&repos)?;
+            let cmd = format!(
+                "{} repo clone {} {}",
+                quote(&self.cfg.watch.gh),
+                quote(&format!("{owner}/{repo}")),
+                quote(&clone.display().to_string())
+            );
+            shell::sh(&cmd, None, None, Duration::from_secs(300))?.into_stdout("gh repo clone")?;
+        }
+        let remote = pr_remote(&clone, &owner, &repo)?;
+        // `review-<repo>-<n>`, with room left for a `-NN` suffix.
+        let digits = number.to_string();
+        let room = 40 - "review-".len() - 1 - digits.len() - 3;
+        let stem: String = slug(&repo).chars().take(room).collect();
+        let base = format!("review-{}-{digits}", stem.trim_end_matches(['-', '_']));
+        // Reserve `<home>/worktrees/<name>` by creating it: whoever creates
+        // it owns the name, even against another drovr process.
+        let worktrees = home().join("worktrees");
+        std::fs::create_dir_all(&worktrees)?;
+        let mut name = String::new();
+        for i in 1..1000 {
+            let n = if i == 1 {
+                base.clone()
+            } else {
+                format!("{base}-{i}")
+            };
+            if self.store.agent(&n)?.is_some() {
+                continue;
+            }
+            match std::fs::create_dir(worktrees.join(&n)) {
+                Ok(()) => {
+                    name = n;
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        if name.is_empty() {
+            bail!("couldn't find a free name for {base}");
+        }
+        let cwd = worktrees.join(&name);
+        let tidy = |clone: &Path| {
+            let _ = git_in(
+                clone,
+                &format!(
+                    "worktree remove --force {}",
+                    quote(&cwd.join("pr").display().to_string())
+                ),
+            );
+            let _ = git_in(
+                clone,
+                &format!("branch -D {}", quote(&format!("drovr/{name}"))),
+            );
+            let _ = git_in(clone, "worktree prune");
+            let _ = std::fs::remove_dir_all(&cwd);
+        };
+        if let Err(e) = self.make_pr_worktree(&clone, &remote, &name, number) {
+            tidy(&clone);
+            return Err(e);
+        }
+        let started = self.start_agent(NewAgent {
+            name: name.clone(),
+            role: "pr-reviewer".into(),
+            cwd: cwd.display().to_string(),
+            ticket: url.to_string(),
+            task: prompts::pr_review_task(url, &self.cfg.stages.review_skill),
+            model: self.cfg.stages.model(crate::config::REVIEW).to_string(),
+            ..NewAgent::default()
+        });
+        if started.is_err() {
+            tidy(&clone);
+        }
+        started
+    }
+
+    /// The PR's head commit, fetched from `remote`, as a worktree at
+    /// `<home>/worktrees/<name>/pr` on branch `drovr/<name>`. The agent runs
+    /// in the folder around it, so the PR's own agent config never loads.
+    fn make_pr_worktree(&self, clone: &Path, remote: &str, name: &str, number: u64) -> Result<()> {
+        let dir = home().join("worktrees").join(name).join("pr");
+        let tmp = format!("refs/drovr/pr/{name}-{}", std::process::id());
+        git_in(
+            clone,
+            &format!(
+                "fetch --quiet {} {}",
+                quote(remote),
+                quote(&format!("+pull/{number}/head:{tmp}"))
+            ),
+        )?
+        .into_stdout("git fetch the PR")?;
+        let _ = git_in(clone, "worktree prune");
+        let added = git_in(
+            clone,
+            &format!(
+                "worktree add {} -b {} {}",
+                quote(&dir.display().to_string()),
+                quote(&format!("drovr/{name}")),
+                quote(&tmp)
+            ),
+        )
+        .and_then(|o| o.into_stdout("git worktree add"));
+        let _ = git_in(clone, &format!("update-ref -d {}", quote(&tmp)));
+        added.map(|_| ())
     }
 
     /// Stop a build agent's reviewer, if it has one that's still going.
@@ -1396,6 +1599,9 @@ impl Engine {
         let _ = std::fs::remove_dir_all(home().join("agents").join(name));
         let worktree = home().join("worktrees").join(name);
         match agent {
+            Some(a) if a.role == "pr-reviewer" && Path::new(&a.cwd) == worktree => {
+                Ok(remove_pr_worktree(&worktree, name))
+            }
             Some(a) if Path::new(&a.cwd) == worktree => Ok(remove_worktree(&worktree, name)),
             _ => Ok(String::new()),
         }
@@ -1901,6 +2107,21 @@ Plan the work, spawn workers with spawn_worker (or coordinate the agents already
                         json!({ "reason": item.payload["trigger"], "ticket": item.payload["ticket"], "by": "you" }),
                     );
                     self.prompt(agent, text)?;
+                }
+            }
+            // A PR to review: "Dispatch reviewer" starts one, anything else
+            // dismisses it. If the reviewer can't start, the item stays.
+            "review" => {
+                if answer == "Dispatch reviewer" {
+                    let url = item.payload["url"].as_str().unwrap_or("");
+                    let agent = self.dispatch_review(url)?;
+                    self.store.resolve_item(
+                        id,
+                        "answered",
+                        &format!("Reviewer {} started", agent.name),
+                    )?;
+                } else {
+                    self.store.resolve_item(id, "dismissed", answer)?;
                 }
             }
             // A Jira update you approved, as you edited it: the comment's

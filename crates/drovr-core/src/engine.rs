@@ -603,9 +603,60 @@ impl Engine {
                 &self.cfg.your_name(),
             );
         }
+        text += &self.standing_instructions();
         let path = self.agent_dir(&agent.name).join("system.md");
         std::fs::write(&path, text)?;
         Ok(path)
+    }
+
+    /// `defaults.instructions` as a prompt section, read fresh on every run.
+    fn standing_instructions(&self) -> String {
+        let files = &self.cfg.defaults.instructions;
+        if files.is_empty() {
+            return String::new();
+        }
+        let you = self.cfg.your_name();
+        let mut out = crate::config::personalize(
+            &format!(
+                "\n## Standing instructions\n\n{you} wants these followed in all your work. They override any general habits.\n"
+            ),
+            &you,
+        );
+        let mut used = 0;
+        for file in files {
+            let path = crate::config::expand_tilde(file);
+            let name = std::path::Path::new(&path)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.clone());
+            // A skill's file is SKILL.md; its folder is the name that means something.
+            let name = if name == "SKILL.md" {
+                std::path::Path::new(&path)
+                    .parent()
+                    .and_then(|p| p.file_name())
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or(name)
+            } else {
+                name
+            };
+            match std::fs::read_to_string(&path) {
+                Ok(raw) => {
+                    let body = truncate(&prompts::instruction_text(&raw), 20_000);
+                    used += body.chars().count();
+                    if used > 60_000 {
+                        out += "\n- drovr left out the rest: standing instructions are capped at 60,000 characters.\n";
+                        break;
+                    }
+                    out += &format!("\n### {name}\n\n{body}\n");
+                }
+                Err(e) => {
+                    out += &format!(
+                        "\n### {name}\n\n- drovr couldn't read {path} ({e}). Tell {you}.\n"
+                    );
+                }
+            }
+        }
+        out
     }
 
     fn make_worktree(&self, cwd: &str, name: &str) -> Result<String> {
@@ -2798,6 +2849,159 @@ fn rendered_log_by(path: &Path, parse: &dyn Fn(&Value, &mut Value) -> Event) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An engine with a group (lead and worker) and a solo agent, its
+    /// standing instructions set to `files`.
+    fn instructions_engine(case: &str, files: &[String]) -> (PathBuf, Engine) {
+        let dir = std::env::temp_dir().join(format!("drovr-instr-{}-{case}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cfg = Config::default();
+        cfg.defaults.auto_wake = false;
+        cfg.defaults.instructions = files.to_vec();
+        let engine = Engine::with(
+            Store::open(&dir.join("t.db")).unwrap(),
+            cfg,
+            PathBuf::from("drovr"),
+        );
+        engine
+            .store
+            .add_group("ig", "", "", "/tmp", "", true)
+            .unwrap();
+        for (name, group, role) in [
+            (format!("{case}-lead"), "ig", "orchestrator"),
+            (format!("{case}-api"), "ig", "worker"),
+            (format!("{case}-solo"), "", "solo"),
+        ] {
+            engine
+                .store
+                .add_agent(&Agent {
+                    name,
+                    group_name: group.into(),
+                    role: role.into(),
+                    ..Agent::default()
+                })
+                .unwrap();
+        }
+        (dir, engine)
+    }
+
+    fn prompt_of(engine: &Engine, name: &str) -> String {
+        let agent = engine.agent(name).unwrap();
+        let path = engine.system_prompt_file(&agent).unwrap();
+        std::fs::read_to_string(path).unwrap()
+    }
+
+    #[test]
+    fn standing_instructions_reach_every_agent() {
+        let dir = std::env::temp_dir().join(format!("drovr-instr-files-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("skills/drovr-sre-standing-rules")).unwrap();
+        let a = dir.join("a.md");
+        std::fs::write(&a, "Use pnpm.").unwrap();
+        let skill = dir.join("skills/drovr-sre-standing-rules/SKILL.md");
+        std::fs::write(
+            &skill,
+            "---\nname: rules\ndescription: d\n---\n\nNo cd prefixes.\n",
+        )
+        .unwrap();
+        let files = [a.display().to_string(), skill.display().to_string()];
+        let (_d, engine) = instructions_engine("all", &files);
+        for name in ["all-lead", "all-api", "all-solo"] {
+            let p = prompt_of(&engine, name);
+            for want in [
+                "## Standing instructions",
+                "### a.md",
+                "Use pnpm.",
+                "### drovr-sre-standing-rules",
+                "No cd prefixes.",
+            ] {
+                assert!(p.contains(want), "{name}: {want}\n{p}");
+            }
+            assert!(!p.contains("description:"), "{name}\n{p}");
+            assert!(
+                p.find("## Standing instructions").unwrap()
+                    > p.find("You are the drovr agent").unwrap(),
+                "{name}\n{p}"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_instruction_file_is_reported() {
+        let (_d, engine) = instructions_engine("missing", &["/nonexistent/rules.md".into()]);
+        let p = prompt_of(&engine, "missing-solo");
+        assert!(
+            p.contains("drovr couldn't read /nonexistent/rules.md"),
+            "{p}"
+        );
+        assert!(p.contains("### rules.md"), "{p}");
+    }
+
+    #[test]
+    fn tilde_instruction_paths_are_expanded() {
+        let (_d, engine) = instructions_engine("tilde", &["~/drovr-nonexistent-xyz.md".into()]);
+        let p = prompt_of(&engine, "tilde-solo");
+        let want = crate::config::expand_tilde("~/drovr-nonexistent-xyz.md");
+        assert!(p.contains(&format!("couldn't read {want}")), "{p}");
+        assert!(!p.contains("couldn't read ~/"), "{p}");
+    }
+
+    #[test]
+    fn instruction_contents_are_not_personalized() {
+        let dir = std::env::temp_dir().join(format!("drovr-instr-pers-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("rules.md");
+        std::fs::write(&f, "ask the human first").unwrap();
+        let (_d, mut engine) = instructions_engine("pers", &[f.display().to_string()]);
+        engine.cfg.defaults.your_name = "Izz".into();
+        let p = prompt_of(&engine, "pers-solo");
+        assert!(p.contains("ask the human first"), "{p}");
+        assert!(p.contains("Izz wants these followed"), "{p}");
+    }
+
+    #[test]
+    fn instructions_are_capped_in_total() {
+        let dir = std::env::temp_dir().join(format!("drovr-instr-cap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let files: Vec<String> = ["one", "two", "three"]
+            .iter()
+            .map(|n| {
+                let f = dir.join(format!("{n}.md"));
+                std::fs::write(&f, "x".repeat(25_000)).unwrap();
+                f.display().to_string()
+            })
+            .collect();
+        let (_d, engine) = instructions_engine("cap", &files);
+        let p = prompt_of(&engine, "cap-solo");
+        assert!(p.contains("### one.md") && p.contains("### two.md"), "{p}");
+        assert!(!p.contains("### three.md"));
+        assert!(p.contains(
+            "- drovr left out the rest: standing instructions are capped at 60,000 characters."
+        ));
+    }
+
+    #[test]
+    fn no_instructions_no_section() {
+        let (_d, engine) = instructions_engine("none", &[]);
+        assert!(!prompt_of(&engine, "none-solo").contains("Standing instructions"));
+    }
+
+    #[test]
+    fn edited_instructions_apply_next_run() {
+        let dir = std::env::temp_dir().join(format!("drovr-instr-edit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("rules.md");
+        std::fs::write(&f, "v1").unwrap();
+        let (_d, engine) = instructions_engine("edit", &[f.display().to_string()]);
+        assert!(prompt_of(&engine, "edit-solo").contains("v1"));
+        std::fs::write(&f, "v2").unwrap();
+        let p = prompt_of(&engine, "edit-solo");
+        assert!(p.contains("v2") && !p.contains("v1"), "{p}");
+    }
 
     #[test]
     fn an_agent_runs_on_its_model_then_its_stages_then_the_default() {

@@ -291,7 +291,7 @@
         {#each isCollapsed(g.group) ? [] : g.agents as a}
           <button class="agent" class:sel={a.name === app.selected} class:lead={a.role === "orchestrator"} onclick={() => (app.selected = a.name)}>
             <div class="row">
-              <span class="name grow">{a.role === "orchestrator" ? "★ " : ""}{a.name}</span>
+              <span class="name grow" class:lettered={a.role === "orchestrator"}>{a.role === "orchestrator" ? "★ " : ""}{a.name}</span>
               {#if a.stage}<span class="pill stage" title="Its stage in the ticket workflow">{a.stage}</span>{/if}
               {#if overBudget(a)}<span class="pill cost" title={`Over your cost warning of $${costCap} (defaults.cost_warning_usd)`}>${a.cost_usd.toFixed(2)}</span>{/if}
               <span class="pill s-{a.state}">{a.state}</span>
@@ -309,7 +309,7 @@
     {#if current}
       <header>
         <div class="row">
-          <h2 class="grow">{current.name}</h2>
+          <h2 class="grow lettered">{current.name}</h2>
           <span class="pill s-{current.state}">{current.state}</span>
           {#if current.state === "working"}
             <button class="danger" onclick={() => act(() => api.stop(current.name), "Stopped")}>Stop</button>
@@ -353,7 +353,7 @@
       <div class="log scroll" bind:this={logEl} onscroll={() => logEl && (follow = logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 40)}>
         {#each lines as l, i}
           <div class="line" data-i={i} class:hit={hits.includes(i)} class:at={i === hitLine}>
-          {#if l.kind === "run"}<div class="sep">{l.text}</div>
+          {#if l.kind === "run"}<div class="sep lettered">{l.text}</div>
           {:else if l.kind === "prompt"}<div class="prompt"><div class="md">{@html md(l.text)}</div></div>
           {:else if l.kind === "text"}<div class="text md">{@html md(l.text)}</div>
           {:else if l.kind === "tool"}<div class="tool"><span>⏵</span> {l.text}</div>
@@ -428,6 +428,9 @@
   .sep { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; border-top: 1px dashed var(--border); margin: 14px 0 6px; padding-top: 6px; }
   .prompt { border-left: 3px solid var(--purple); padding: 4px 10px; background: var(--panel); border-radius: 4px; margin: 6px 0; }
   .text { margin: 6px 0; }
+  /* Gold themes: drovr's message bar and tool lines in the accent gold. */
+  :global([data-foil]) .prompt { border-left-color: var(--accent); }
+  :global([data-foil]) .tool { color: var(--accent); }
   .tool { font-family: var(--mono); font-size: 12px; color: var(--cyan); margin: 2px 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .result { font-size: 12px; color: var(--muted); margin: 0 0 4px 16px; }
   .result summary { cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-family: var(--mono); }

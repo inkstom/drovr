@@ -531,7 +531,9 @@ tls_key = "~/certs/example.com/privkey.pem"
 
 ### Themes
 
-Match System, Light, Dark, Darcula, Solarized Dark and Nord: the same set and colors as local-wiki. Choose one from **View → Theme** or in Settings. Your choice is saved, and Match System follows macOS light/dark.
+Match System, Light, Dark, Darcula, Solarized Dark, Nord, Gilded, Deco Navy, Oxblood and Ink & Gold. The first five are the same set and colors as local-wiki. Gilded, Deco Navy, Oxblood and Ink & Gold add gold lettering on the sidebar wordmark, agent titles, lead agents in the list and run labels, and show drovr's messages and agents' tool calls in gold. Choose one from **View → Theme** or in Settings. Your choice is saved, and Match System follows macOS light/dark.
+
+Themes are defined once, in `app/src/lib/themes.json`. Each has an `id`, a `name`, a `scheme` (`light` or `dark`) and its 13 `colors`, and may have `lettering` with a `color` and a `foil` gradient. The UI and View → Theme both read that file.
 
 ## How it works
 
@@ -824,7 +826,8 @@ pnpm tauri:build:signed              # signed + notarized
 crates/drovr-core    state, engine, MCP server, sources, reports, review
 crates/drovr-cli     the `drovr` binary (MCP server, run hook, scripting)
 app/src              Svelte UI (views in src/lib/components/)
-app/src-tauri        Tauri shell: commands, menu, themes; icons/ (icon.svg is the source)
+app/src/lib/themes.json   the themes: colors and lettering
+app/src-tauri        Tauri shell: commands, menu, themes.rs; icons/ (icon.svg is the source)
 scripts/             build-signed.sh
 docs/                signing.md, screenshots, icon
 USAGE.md             commands and workflows

@@ -19,24 +19,30 @@
   import Shortcuts from "#lib/components/Shortcuts.svelte";
   import Timeline from "#lib/components/Timeline.svelte";
   import Pipeline from "#lib/components/Pipeline.svelte";
+  import Prs from "#lib/components/Prs.svelte";
+  import Insights from "#lib/components/Insights.svelte";
 
-  // Pipeline is part of the ticket workflow (workflow.enabled).
+  // Pipeline is part of the ticket workflow (workflow.enabled). PRs shows once
+  // [review] has a channel or team, or rows exist.
   const nav: { id: View; label: string; key: string; tip: string }[] = $derived([
     { id: "agents", label: "Agents", key: "1", tip: "Every agent and group: their output, status and controls" },
     { id: "inbox", label: "Inbox", key: "2", tip: "Decisions, commands and permissions waiting for you" },
     { id: "reports", label: "Reports", key: "3", tip: "Reports agents published for you to review" },
-    { id: "jira", label: "Jira", key: "4", tip: "Your sprint and tickets; hand one to agents" },
+    { id: "jira", label: "Jira", key: "4", tip: "Find a ticket, read it, hand it off" },
     { id: "search", label: "Slack · Confluence", key: "5", tip: "Ask a question across Slack, Confluence and your other tools" },
     { id: "bus", label: "Message bus", key: "6", tip: "Messages agents send each other" },
     { id: "review", label: "Code review", key: "7", tip: "What an agent changed in each repo, with diffs" },
-    { id: "settings", label: "Settings", key: "8", tip: "drovr's configuration" },
+    ...(app.defaults?.review_enabled || app.snap.review_prs.length ? [{ id: "prs" as View, label: "PRs", key: "8", tip: "PRs waiting on your review; send a reviewer agent" }] : []),
     ...(app.defaults?.workflow ? [{ id: "pipeline" as View, label: "Pipeline", key: "9", tip: "Your sprint's tickets through the workflow stages" }] : []),
+    { id: "insights", label: "Insights", key: "0", tip: "What runs cost, how models' PRs fared, and retros" },
+    { id: "settings", label: "Settings", key: ",", tip: "drovr's configuration" },
   ]);
 
   // Both ⌘ and Ctrl work; show the one people press on this platform.
   const mod = /Mac/i.test(navigator.platform || navigator.userAgent) ? "⌘" : "Ctrl+";
 
   const working = $derived(app.snap.agents.filter((a) => a.state === "working").length);
+  const newPrs = $derived(app.snap.review_prs.filter((r) => r.status === "new").length);
   const blocked = $derived(app.snap.agents.filter((a) => a.state === "blocked").length);
 
   onMount(() => {
@@ -46,6 +52,7 @@
       if (app.view !== "agents") { app.view = "agents"; app.termOpen = true; }
       else app.termOpen = !app.termOpen;
     });
+    const offSettings = listen("menu:menu-settings", () => (app.view = "settings"));
     const offCli = listen("menu:menu-install-cli", () => { act(() => api.installCli()).then((m) => m && toast(m)); });
     refresh();
     api.defaults().then((d) => { app.you = d.your_name; app.defaults = d; }).catch(() => {});
@@ -62,7 +69,7 @@
       if (e.key === "/") { app.shortcutsOpen = true; e.preventDefault(); }
     };
     window.addEventListener("keydown", onKey);
-    return () => { stopTheme(); offFind.then((f) => f()); offTerm.then((f) => f()); offKeys.then((f) => f()); offCli.then((f) => f()); clearInterval(t); window.removeEventListener("keydown", onKey); };
+    return () => { stopTheme(); offFind.then((f) => f()); offTerm.then((f) => f()); offKeys.then((f) => f()); offCli.then((f) => f()); offSettings.then((f) => f()); clearInterval(t); window.removeEventListener("keydown", onKey); };
   });
 </script>
 
@@ -74,6 +81,7 @@
         <button class="nav" class:active={app.view === n.id} aria-current={app.view === n.id ? "page" : undefined} onclick={() => (app.view = n.id)} title={n.key ? `${n.tip} (${mod}${n.key})` : n.tip}>
           <span>{n.label}</span>
           {#if n.id === "inbox" && app.snap.inbox.length}<span class="badge">{app.snap.inbox.length}</span>{/if}
+          {#if n.id === "prs" && newPrs}<span class="badge new">{newPrs}</span>{/if}
           {#if n.id === "reports" && app.snap.unseen_reports}<span class="badge new">{app.snap.unseen_reports}</span>{/if}
           {#if n.id === "agents" && app.snap.agents.length}<span class="count">{app.snap.agents.length}</span>{/if}
         </button>
@@ -101,6 +109,8 @@
     {:else if app.view === "bus"}<Bus />
     {:else if app.view === "review"}<Review />
     {:else if app.view === "pipeline"}<Pipeline />
+    {:else if app.view === "prs"}<Prs />
+    {:else if app.view === "insights"}<Insights />
     {:else}<Settings />{/if}
   </main>
 </div>

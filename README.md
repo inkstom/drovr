@@ -34,7 +34,7 @@ A lightweight macOS desktop control plane (Rust, Tauri + Svelte) for orchestrati
 
 ## Status
 
-drovr is at version 0.15.1. <!-- x-release-please-version -->
+drovr is at version 0.17.1. <!-- x-release-please-version -->
 
 **Tested so far:**
 
@@ -105,14 +105,17 @@ cargo install --path crates/drovr-cli
 | Slack · Confluence | 5 | Search, read, send results to an agent, or ask a free-form question |
 | Message bus | 6 | Agents' messages to each other, and each group's shared notes, with a filter |
 | Code review | 7 | Changed files and diffs in each repo and worktree an agent worked in |
-| Settings | 8 | Theme, the phone page's sign-in link, and your config file |
-| Pipeline | 9 | Your sprint, its PRs and the agents on each ticket, and the retros (only with `workflow.enabled`) |
+| PRs | 8 | PRs waiting on your review, from offer to merge (once `[review]` watches a channel or team) |
+| Pipeline | 9 | Your sprint, its PRs and and the agents on each ticket (only with `workflow.enabled`) |
+| Insights | 0 | What runs cost, day by day, and by harness, model, stage and ticket; and how PRs turned out, by model; and the retros |
+
+Settings is ⌘/Ctrl+, (**drovr → Settings…**): theme, the phone page's sign-in link, and your config file.
 
 A ticket's **Timeline** opens over any view, from an agent's header, a group, or Pipeline.
 
 **Shortcuts** (⌘/Ctrl+/ lists them all in the app; [USAGE.md](USAGE.md#keyboard-shortcuts) has the table):
 
-- **Anywhere:** ⌘/Ctrl+1 … 9 switch views. ⌘/Ctrl+N starts a new agent and ⌘/Ctrl+G a new group. ⌘/Ctrl+F (Edit → Find…) finds text in the selected agent's output, or focuses the filter on the Message bus. ⌃` shows or hides the terminal. Esc closes a dialog.
+- **Anywhere:** ⌘/Ctrl+1 … 9 switch views and ⌘/Ctrl+, opens Settings. ⌘/Ctrl+N starts a new agent and ⌘/Ctrl+G a new group. ⌘/Ctrl+F (Edit → Find…) finds text in the selected agent's output, or focuses the filter on the Message bus. ⌃` shows or hides the terminal. Esc closes a dialog.
 - **In an agent's prompt box:** Enter sends and Shift+Enter adds a new line.
 - **In the Inbox:** ↓↑ or J K move, 1–9 pick an option, A allows or starts, D denies or declines (see [Inbox](#inbox)).
 - **In Settings:** ⌘/Ctrl+S saves.
@@ -263,14 +266,14 @@ To publish a report, or any local HTML file, as a claude.ai artifact:
 
 drovr keeps a record of everything that happens on a ticket, so you can look back at how the work went and, later, run a retro on it.
 
-**It's off by default, as one switch:** `workflow.enabled = true` (in `[workflow]`) turns on the whole ticket workflow together: the record and timeline, agents' `record_decision` and `draft_jira_update` tools, the watcher and Pipeline (⌘9), stages in groups created from then on, and the retro. Set it back to `false` and drovr works exactly as before: nothing more is recorded or polled, agents get the old tools from their next run, and the timeline buttons and Pipeline go away. Records already written stay on disk. The switch takes effect when you save it in Settings; agents pick it up on their next run.
+**It's off by default, as one switch:** `workflow.enabled = true` (in `[workflow]`) turns on the whole ticket workflow together: the record and timeline, agents' `record_decision` and `draft_jira_update` tools, the watcher and Pipeline (⌘9), stages in groups created from then on, and the retro. Set it back to `false` and drovr works as before: nothing more is recorded on tickets or polled (what runs cost still is; see [The spend log](#the-spend-log)), agents get the old tools from their next run, and the timeline buttons and Pipeline go away. Records already written stay on disk. The switch takes effect when you save it in Settings; agents pick it up on their next run.
 
 The record is plain files: `ledger.jsonl` in the ticket's own folder, one JSON event per line, only ever appended to. The folder is in the group's plans folder (`~/.claude/plans/<group>/<TICKET>/`), or in the plans folder itself for a solo agent's ticket (`~/.claude/plans/<TICKET>/`). You can read the file in any editor, keep it in git, or hand it to an agent.
 
-- **Which agents:** an agent's events go to its own tickets (its **Ticket** field, e.g. `SRE-3230, SRE-3253`), or to its group's ticket when it has none. An agent with no ticket has no record.
+- **Which agents:** an agent's events go to its own tickets (its **Ticket** field, e.g. `SRE-3230, SRE-3253`), or to its group's ticket when it has none. An agent with no ticket has no record. Once a ticket's agents and group are gone, retros and what the watcher sees still go to its existing record (the one written to last).
 - **What's recorded:**
   - **Agents:** agents starting and being removed.
-  - **Runs:** each run's start (its prompt, the configured model, a new or resumed session) and its end (how it ended, cost, duration, turns, tokens in and out and from the cache, and the models it used).
+  - **Runs:** each run's start (its prompt, the configured model, a new or resumed session) and its end (how it ended, cost, duration, turns, tokens in and out and from the cache, the models it used, and what each cost when the CLI says).
   - **The Inbox:** each item as it's asked (questions, commands, permissions, worker requests, done reports) and how it was resolved (answered, declined or dismissed, and how long it waited).
   - **Agent decisions:** what agents decided themselves, with `record_decision`.
   - **Messages:** messages between agents and from you.
@@ -283,6 +286,35 @@ The record is plain files: `ledger.jsonl` in the ticket's own folder, one JSON e
 - **Secrets stay out:** anything that looks like a credential (GitHub, GitLab and Slack tokens, Anthropic and AWS keys, bearer tokens) is replaced with `[redacted]` before it's written.
 - **Timeline:** **Timeline** in an agent's header, or **timeline** on a group, shows the record. It has a day-by-day list you can filter (runs, decisions and the Inbox, messages and prompts, status and reports, agents and wakes, Jira and PRs, stages, retro) with totals at the top: runs and cost, questions asked and declined, decisions, wakes. Click an event to see all of it. **Show folder** opens the ticket's folder in Finder, and **Start retro** starts a retro on the ticket.
 - **Nothing else changes:** writing the record never stops the work. If a write fails, drovr logs it and carries on.
+
+### The spend log
+
+drovr records what each run cost, in its database (`drovr.db` in its state folder, `~/.local/share/drovr`), **whether or not `workflow.enabled` is on**. A row per run and model holds the time, the agent with its role, group, tickets and stage, the harness, the model, the cost, the token counts, how long it took and how it ended. It never holds a prompt, a message or a task, and it stays on your Mac.
+
+- **Costs are what the CLI reports.** When it reports none (Codex, or a run that was killed), the cost is unknown, not zero.
+- **Models go by one name,** however the run was started (`opus`, or a gateway's path in OpenCode); the name it was started with is kept too.
+- **Earlier runs** are added once, from the tickets' records, the first time the app runs with the log. Records don't say whether a zero cost was reported, so those count as unknown.
+
+### Insights
+
+**Insights** (⌘0) adds up the spend log, whether or not the workflow is on:
+
+- **Totals:** what you spent, an average full week and day (weekends too), and an average retro (its agent's runs). Set `weekly_target_usd` under `[insights]` to show a target beside the week.
+- **Spend by day:** stacked by harness, for the last 2, 4, 8, 12 or 26 weeks, which start on Mondays. A ◆ marks each day a retro was started. **Show table** gives the same numbers as a table.
+- **By harness, model, stage and ticket:** each adds up to the total. A model run through OpenCode is marked `(OC)`, apart from the same model in Claude Code. A run on several tickets is split evenly between them.
+
+Runs whose CLI reported no cost are counted separately, and the totals leave them out. A retro with no cost in the spend log, such as one from before the log, isn't in the average retro.
+
+With the workflow on, the watcher also keeps what became of each PR it follows (`watch.github_repos`): when it was ready, merged or closed, pushes and failed CI once it was ready, how many of its heads others reviewed, and its size. The Overview shows the cost per merged PR (everything spent, divided by the PRs merged), the share reworked, and the median time from ready to merged.
+
+**Models** compares what merged PRs cost by the model that built them, rework included:
+
+- **Rework:** a PR took rework if, once it was ready for review, it was pushed to again, its CI failed or changes were requested, or if you sent its build handoff back while it was open. The builder's and its reviewer's runs that start after it was ready (or sent back) are the rework, and count against the model that built it, whichever model ran them.
+- **Like with like:** PRs are grouped by size (added and deleted lines: up to 100, up to 500, over 500), by model, and by whether the builder had a reviewer. A group with fewer than 10 PRs says it's too small to compare.
+- **Who built it:** the agent whose `drovr/<agent>` branch it is, else the one build agent with a worktree of that repo on the PR's branch, else its tickets' only build agent. It's never guessed. A builder's runs are shared evenly by its PRs that are still open, so costs of PRs built together are estimates.
+- **Left out, and counted:** PRs not seen from the start (first seen over an hour after they were opened, or already merged), with no one certain builder, with no runs logged, or built by several models, a router or an alias whose version isn't known.
+
+Earlier PRs are added once, from the tickets' records. Those don't say how big a PR was or how often it was reviewed.
 
 ### Stages
 
@@ -313,9 +345,9 @@ Part of the ticket workflow (`workflow.enabled`). A ticket goes through stages, 
 
 ### The retro
 
-Part of the ticket workflow (`workflow.enabled`), and it runs only when you start one: **Start retro** in a ticket's timeline, or **Retro…** in Pipeline to pick several tickets. The picker shows when each ticket's last retro ran, and hides tickets with nothing new since their retro behind a toggle. Add a note if there's something to look at in particular.
+Part of the ticket workflow (`workflow.enabled`), and it runs only when you start one: **Start retro** in a ticket's timeline, or **Retro…** under **Retros** in Insights (⌘0) to pick several tickets. The picker has four lists: **Not covered** (no retro has read them), **New work** (agents, PRs or reviews moved since the last retro; Jira changes and cleanup don't count), **Covered**, and **Hidden**. The first two start out picked, and a retro on a ticket with new work starts from where the last one stopped. **Hide** takes a ticket out of its list, and **Show** puts it back. With `retro.hide_decided`, a covered ticket is hidden once you've decided every proposal of its retros. A hidden ticket comes back when there's new work on it, and its record is kept. Add a note if there's something to look at in particular.
 
-1. **The numbers:** drovr works them out from the tickets' records itself and saves them as `evidence.json` in the retro's folder (`~/.claude/plans/retros/<when>/`). They cover runs, cost and tokens by stage and model, rework (handoffs sent back, CI failures, changes requested), dismissals (Inbox items declined or dismissed), misses (PRs closed unmerged), overrides (a stage's model changed at a handoff), wakes, checkpoints, how long the Inbox waited on you, and your stops and **Send now**s.
+1. **The numbers:** drovr works them out from the tickets' records itself and saves them as `evidence.json` in the retro's folder (`~/.claude/plans/retros/<when>/`). They cover runs, cost and tokens by stage, harness and model (a model has one name however it was started: `opus`, `claude-opus-5-5` or a gateway's `…/anthropic/claude-opus-5.5`), rework (handoffs sent back, CI failures, changes requested), dismissals (Inbox items declined or dismissed), misses (PRs closed unmerged), overrides (a stage's model changed at a handoff), wakes, checkpoints, how long the Inbox waited on you, and your stops and **Send now**s.
 2. **The retro agent** (on `retro.model`) reads the records, the handoffs and those numbers. It gets your current stages, models, limits, rules and skills, and the last 50 proposals from earlier retros with what you decided, so it doesn't bring back one you dismissed without new evidence. It submits proposals, each with its evidence:
    - **model:** a stage's model (`stages.models.<stage>`): cheaper where rework stays low, stronger where rework costs more than it saves.
    - **threshold:** the build checkpoint limits.
@@ -324,7 +356,7 @@ Part of the ticket workflow (`workflow.enabled`), and it runs only when you star
    - **skill_edit / new_skill:** a whole `SKILL.md`.
 
    It also publishes a short report to Reports.
-3. **You decide:** proposals appear under **Retros** at the top of Pipeline. **Approve** one at a time, or **Approve all**, or **Dismiss**. Approving applies it:
+3. **You decide:** proposals appear under **Retros** in Insights. **Approve** one at a time, or **Approve all**, or **Dismiss**. Approving applies it:
    - **Config changes:** written to your `config.toml` with its comments and layout kept. The file before the change is saved beside it as `config.toml.before-retro`. drovr only changes the keys above.
    - **Skills:** written to `retro.skills_dir/<name>/SKILL.md` (`~/.claude/skills`), with the one it replaces kept beside it.
    - **The record:** every approval and dismissal goes into the tickets' records and the retro's `decisions.jsonl`. Every later retro is told about them, whichever tickets it's on.
@@ -339,8 +371,9 @@ drovr's watcher keeps it current without an agent, so it spends no tokens:
 
 - **Jira:** every `watch.jira_poll_secs` (5 minutes) it runs the `watch.jql` query (by default your open sprint) through the Jira `command` provider (twg) or `rest`. It reads a ticket in full, with its comments, only when its `updated` time moved.
 - **Pull requests:** every `watch.pr_poll_secs` (2 minutes, or 1 while checks run) it searches `watch.github_repos` with `gh` for PRs whose title has one of those ticket keys (`owner/repo`, or `owner/*` for all of an owner's repos), and looks closer at PRs that changed or whose checks are still running.
-- **Into the record:** status moves, new comments, tickets joining or leaving the sprint, PRs linked, CI passing or failing, reviews, conflicts, merges and closes go to each ticket's record (for tickets an agent or group is on). The first read only takes a baseline. After that, an open PR the watcher hasn't seen before (a new one, or one whose ticket just came into view) counts as changed from nothing: reviews, failing checks, a conflict, or being green and waiting on review already on it, draft or not, go through `watch.rules` once.
+- **Into the record:** status moves, new comments, tickets joining or leaving the sprint, PRs linked, CI passing or failing, reviews, conflicts, merges and closes go to each ticket's record (for tickets an agent or group is on, or that already have a record). The first read only takes a baseline. After that, an open PR the watcher hasn't seen before (a new one, or one whose ticket just came into view) counts as changed from nothing: reviews, failing checks, a conflict, or being green and waiting on review already on it, draft or not, go through `watch.rules` once.
 - **While the app is closed** nothing is read. drovr keeps what it last saw in `watch.json` in its data folder, so the first read after you open the app records what changed meanwhile.
+- **GitHub's quota:** before each GitHub poll, drovr reads your API quota with `gh api rate_limit`, which doesn't count against it. Below 25% of the GraphQL quota it polls 4 times less often; below 5% of the GraphQL or search quota it waits for the reset. The header then shows "GitHub quota low, next check 11:09". **Refresh now** still reads GitHub unless a quota is empty. Jira keeps its own timing. The REST quota isn't counted, since these polls don't use it. PR review polling works the same way.
 - **Refresh now** reads both at once. Errors (a missing `gh`, `twg` needing `twg login`, a search command whose JSON has no issue keys) show at the top. The search command can print a list of issues, Jira's `{"issues": […]}`, or either inside twg's `-o json` envelope (`"data"`).
 
 With twg, set the Jira provider to it:
@@ -365,7 +398,7 @@ For each change, `watch.rules` says whether to **wake** the agent that owns the 
 | --- | --- | --- | --- |
 | `ci_failed` | A PR's checks have all finished and some failed | wake | The failing checks and the end of the failing GitHub Actions log (`gh run view --log-failed`, last 150 lines) |
 | `ci_passed` | Its checks went from pending or failing to passing | wake | CI passed and a nudge to carry on |
-| `changes_requested` | A reviewer requested changes | wake | The latest reviews and inline review comments (file:line) |
+| `changes_requested` | A reviewer requested changes | wake | Each reviewer's latest review and every unresolved review thread (file:line) |
 | `new_review` | Each new review without a change request (fires for every review, not once per commit) | wake | The same |
 | `ready_for_review` | Green, mergeable, no review decision yet; once per commit | ask | A "waiting on review" item for you |
 | `conflict` | The PR has merge conflicts | wake | What to do: merge the base in, resolve, push |
@@ -490,7 +523,7 @@ For any agent, this lists every git repo and worktree it worked in, so it works 
 
 ### Review PRs from Slack and GitHub
 
-drovr can watch Slack channels for GitHub PR links and your GitHub teams for review requests, and offer each PR in the Inbox as a **PR review** item. Set `review.slack_channels` (such as `"#sre-reviews"`) and `review.github_teams` (`"org/team"`), and drovr looks every `review.poll_secs` while the app runs. **Dispatch reviewer** starts a reviewer and **Dismiss** drops the item; with `review.auto_dispatch` it starts without asking.
+drovr can watch Slack channels for GitHub PR links and your GitHub teams for review requests, and list each PR in **PRs** (⌘8), from when it's found until it merges or closes. Set `review.slack_channels` (such as `"#sre-reviews"`) and `review.github_teams` (`"org/team"`), and drovr looks every `review.poll_secs` while the app runs. New PRs wait under **New**, where **Dispatch reviewer** starts a reviewer and **Dismiss** hides the PR; with `review.auto_dispatch` it starts without asking. A reviewed PR moves under **Reviewing**, with **Open reviewer**, **Report** and **Dismiss**, which removes the reviewer. Each row shows CI, GitHub's review decision and your own latest review, refreshed on every poll (**Refresh** polls now). New PRs raise a notification while drovr is in the background, show as a count on the PRs item, and add to the Dock badge; they don't go to the Inbox. The phone page doesn't show PRs yet.
 
 - **Where it works:** each reviewer gets its own folder, `<home>/worktrees/<name>`, and the PR's head is checked out in `./pr` inside it. The reviewer runs in the folder, not in `pr`, so the PR's own agent config (`.claude/settings.json` hooks, `.mcp.json`, `opencode.json`, `.opencode/`, Codex config) is never loaded: the PR's own agent config can't run code when the reviewer starts. It reads the PR with `git -C pr …` and `gh pr diff`. The clone is `<review.repos_dir>/<repo>` (`defaults.cwd` when `repos_dir` is empty), and drovr clones it with `gh` if it's missing. It fetches from whichever remote points at the PR's repo, so a clone with `origin` as your fork and `upstream` as the base works. If no remote matches, the reviewer fails with an error that says so.
 - **Read-only:** the reviewer doesn't change anything on GitHub until you tell it to post. That's enforced by its instructions, so to make it a hard stop, keep `gh pr review` and `gh pr comment` out of `permissions.auto_allow`. It doesn't run the PR's code, scripts or tests unless you ask.
@@ -498,7 +531,8 @@ drovr can watch Slack channels for GitHub PR links and your GitHub teams for rev
 - **Only some owners:** set `review.owners = ["my-org"]` to offer and dispatch only PRs in those GitHub orgs or users (case-insensitive); empty is any. `drovr review <url>` refuses other owners too.
 - **What it produces:** a report titled "Review owner/repo#n" and a message with a summary. It stays running, so you can talk to it.
 - **Removing it** deletes its worktree and its branch, even with uncommitted files. With `review.remove_when_closed`, a reviewer that isn't working is removed once its PR merges or closes, including ones you started with `drovr review <url>`, as long as `review.poll_secs` isn't 0.
-- **What's skipped:** closed PRs and your own. A draft requested from your team is offered once it's ready; one linked in Slack is skipped. Each PR is offered once. The first poll looks back one day, and never more than 7.
+- **What's skipped:** closed PRs and your own. While drovr can't tell your GitHub login it offers nothing, and tries again on the next poll. Your own PRs already under **New** are removed when they're refreshed. A draft requested from your team is offered once it's ready; one linked in Slack is skipped. Each PR is offered once. A PR you dismissed comes back if someone posts it in a watched channel after you dismissed it. The first poll looks back one day, and never more than 7.
+- **GitHub's quota:** polls, including the Slack read, slow down and pause as your GitHub API quota runs low, as in [Pipeline](#pipeline-the-watcher). **Refresh** and `drovr review poll` still run unless a quota is empty.
 - **Slack** is read through the configured [Slack provider](#jira-confluence-and-slack-lookups). With `provider = "agent"`, each poll is a short `claude -p` run, so it costs a little each time.
 
 ### Phone access
@@ -546,7 +580,7 @@ tls_key = "~/certs/example.com/privkey.pem"
 
 Match System, Light, Dark, Darcula, Solarized Dark, Nord, Gilded, Deco Navy, Oxblood and Ink & Gold. The first five are the same set and colors as local-wiki. Gilded, Deco Navy, Oxblood and Ink & Gold add gold lettering on the sidebar wordmark, agent titles, lead agents in the list and run labels, and show drovr's messages and agents' tool calls in gold. Choose one from **View → Theme** or in Settings. Your choice is saved, and Match System follows macOS light/dark.
 
-Themes are defined once, in `app/src/lib/themes.json`. Each has an `id`, a `name`, a `scheme` (`light` or `dark`) and its 13 `colors`, and may have `lettering` with a `color` and a `foil` gradient. The UI and View → Theme both read that file.
+Themes are defined once, in `app/src/lib/themes.json`. Each has an `id`, a `name`, a `scheme` (`light` or `dark`) and its 17 `colors`, and may have `lettering` with a `color` and a `foil` gradient. Four of the colors, `chart-1` to `chart-4`, are for charts, in that order; tests fail if a theme lacks them, if one is hard to see on the background or the panel, or if neighbors look too alike, including with red-green color blindness. The UI and View → Theme both read that file.
 
 ## How it works
 
@@ -697,6 +731,7 @@ drovr reads `~/.config/drovr/config.toml`. Every key is optional, and [`config.e
 | `stages.review_skill` | `""` | A SKILL.md the build reviewers and PR reviewers follow, e.g. `"~/.claude/skills/code-review/SKILL.md"`; empty, they review on their own |
 | `retro.model` | `""` | The retro agent's model; empty for the default |
 | `retro.skills_dir` | `"~/.claude/skills"` | Where approved skill proposals are written |
+| `retro.hide_decided` | `true` | Hide a ticket from the retro picker once you've decided every proposal of its retros, until there's new work on it |
 | `permissions.auto_allow` | read-only tools, `WebSearch` and `mcp__drovr__*` | Tools headless agents use without asking; a trailing `*` matches a prefix. `WebFetch` asks in the Inbox: with `Read` allowed too, an agent misled by text in a ticket, page or Slack message could otherwise send your files to any URL. Add it back if you accept that. |
 | `permissions.wait_seconds` | `900` | How long a permission request waits for you before it's denied |
 | `orchestrator.auto_spawn` | `true` | Start workers without asking first |
@@ -783,7 +818,7 @@ If your herdr version takes different arguments, edit these templates instead of
 | `DROVR_CONFIG` | Use another config file |
 | `DROVR_HOME` | Use another state folder (default `~/.local/share/drovr`) |
 | `DROVR_BIN` | Path to the `drovr` CLI that agents run (default: the copy bundled in the app) |
-| `DROVR_KEEP_PATH` | Don't load PATH from your login shell at startup |
+| `DROVR_KEEP_PATH` | Keep the PATH drovr was launched with instead of asking your login shell (the common folders, such as `/opt/homebrew/bin`, are still added) |
 | `DROVR_AGENT` | Set by drovr inside each agent's process; you don't set this |
 
 ## Files and data
@@ -841,7 +876,7 @@ pnpm tauri:build:signed              # signed + notarized
 
 **CI:** three workflows, with every action pinned to a full commit SHA.
 
-- **Pull requests** (`.github/workflows/ci.yml`): fast checks on Apple Silicon: core tests, the type-check, the app tests and clippy (any warning fails it), using a debug build and no bundle. Its `check` job is required to merge, with no bypass. A PR that only touches docs skips the job, which counts as passing, and a newer push cancels the run in progress.
+- **Pull requests** (`.github/workflows/ci.yml`): fast checks on Apple Silicon: core tests, the type-check, the app tests and clippy (any warning fails it), using a debug build and no bundle. Its `check` job is required to merge, with no bypass. A PR that only touches docs skips the job, which counts as passing, and a newer push cancels the run in progress. It also runs on `main`, where it saves the Rust build cache that pull requests restore.
 - **Release PR** (`.github/workflows/release-please.yml`): every push to `main` updates a release PR kept by [release-please](https://github.com/googleapis/release-please). It holds the next version, worked out from Conventional Commit messages (`fix:` bumps the patch, `feat:` the minor, `feat!:` or `BREAKING CHANGE:` the major, or the minor before 1.0), the new `CHANGELOG.md` entry, and that version in `tauri.conf.json`, `package.json`, the three `Cargo.toml` files, `Cargo.lock` and this README. Commits of other types (`docs:`, `chore:`, `ci:`) don't make a release on their own. The built-in token's PRs don't trigger CI, so the workflow starts CI on the release PR itself, which skips `check` there: the PR only bumps versions and the changelog, and everything in it was tested when it merged. The release build still compiles and verifies the app after the release PR merges.
 - **Releases** (`.github/workflows/release.yml`): merging the release PR tags it and creates the GitHub Release, then this workflow builds a signed, notarized `drovr.app` and `.dmg`, verifies them, and attaches the `.dmg` to that release. The release is titled `drovr-<version>`. It's the only way to release: pushing a `v*` tag by hand builds nothing, and a ruleset stops anyone moving or deleting one. The secrets it needs are listed in [docs/signing.md](docs/signing.md#releasing-from-ci).
 

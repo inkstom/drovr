@@ -29,10 +29,19 @@ pub struct Config {
     pub review: Review,
     pub stages: Stages,
     pub retro: RetroConfig,
+    pub insights: InsightsConfig,
     pub inbox: Inbox,
 }
 
-/// The retro you start from the timeline or Pipeline.
+/// The Insights view.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct InsightsConfig {
+    /// What you mean to spend in a week, in US dollars; 0 for no target.
+    pub weekly_target_usd: f64,
+}
+
+/// The retro you start from the timeline or Insights.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RetroConfig {
@@ -40,6 +49,9 @@ pub struct RetroConfig {
     pub model: String,
     /// Where approved skill proposals are written.
     pub skills_dir: String,
+    /// Hide a ticket from the picker once you've decided every proposal of
+    /// its retros, until there's new work on it.
+    pub hide_decided: bool,
 }
 
 impl Default for RetroConfig {
@@ -47,6 +59,7 @@ impl Default for RetroConfig {
         RetroConfig {
             model: String::new(),
             skills_dir: "~/.claude/skills".into(),
+            hide_decided: true,
         }
     }
 }
@@ -695,6 +708,7 @@ impl Default for Config {
             review: Review::default(),
             stages: Stages::default(),
             retro: RetroConfig::default(),
+            insights: InsightsConfig::default(),
             inbox: Inbox::default(),
         }
     }

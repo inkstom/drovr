@@ -60,6 +60,43 @@ impl Output {
     }
 }
 
+/// How long a timed-out command gets to clean up (lock files, EXIT traps)
+/// after SIGTERM, on top of its timeout, before SIGKILL.
+pub const KILL_GRACE: Duration = Duration::from_secs(3);
+
+/// Has the leader `pid` exited? Doesn't reap it (WNOWAIT), so the zombie keeps
+/// its pid, and so the group id, from being reused before we signal the group.
+fn leader_gone(pid: i32) -> bool {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let r = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    r == 0 && unsafe { info.si_pid() } != 0
+}
+
+/// Stop the process group led by `child`: SIGTERM, wait up to `grace` for the
+/// leader to exit, then SIGKILL the group (survivors hold the output pipes).
+/// SIGKILL alone skips shell traps, so tools that remove a lock on exit
+/// (pyenv's shim lock) would leave it behind. The caller reaps `child`.
+pub fn terminate_group(child: &mut std::process::Child, grace: Duration) {
+    let pgid = child.id() as i32;
+    unsafe { libc::killpg(pgid, libc::SIGTERM) };
+    let start = Instant::now();
+    while start.elapsed() < grace {
+        if leader_gone(pgid) {
+            std::thread::sleep(Duration::from_millis(100));
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    unsafe { libc::killpg(pgid, libc::SIGKILL) };
+}
+
 /// Run `sh -c script` in `cwd`, feeding `stdin`, killing it after `timeout`.
 pub fn sh(
     script: &str,
@@ -108,7 +145,7 @@ pub fn sh(
         }
         if start.elapsed() > timeout {
             timed_out = true;
-            unsafe { libc::killpg(child.id() as i32, libc::SIGKILL) };
+            terminate_group(&mut child, KILL_GRACE);
             break child.wait()?;
         }
         std::thread::sleep(nap);
@@ -156,6 +193,36 @@ pub fn extract_json(text: &str) -> Option<serde_json::Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timeout_sends_term_first_so_traps_run() {
+        let dir = std::env::temp_dir().join(format!("drovr-term-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("cleaned");
+        let script = format!(
+            "trap 'touch {}; exit 0' TERM; sleep 30 & wait",
+            marker.display()
+        );
+        let out = sh(&script, None, None, Duration::from_millis(300)).unwrap();
+        let cleaned = marker.exists();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(out.timed_out);
+        assert!(cleaned);
+    }
+
+    #[test]
+    fn term_ignoring_command_is_killed_after_the_grace() {
+        let began = Instant::now();
+        let out = sh(
+            "trap '' TERM; sleep 30",
+            None,
+            None,
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        assert!(out.timed_out);
+        assert!(began.elapsed() < Duration::from_millis(200) + KILL_GRACE + Duration::from_secs(1));
+    }
 
     #[test]
     fn quotes_and_fills() {

@@ -16,7 +16,7 @@ use crate::store::{Agent, Item, Store};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -578,6 +578,22 @@ impl Engine {
             .collect()
     }
 
+    /// What the last headless run cost by model, where its CLI says.
+    fn last_model_costs(&self, agent: &Agent) -> BTreeMap<String, f64> {
+        let harness = harness::of(agent);
+        let dir = home().join("agents").join(&agent.name).join("runs");
+        let mut costs = Costs::default();
+        let mut last = BTreeMap::new();
+        for run in 1..=agent.runs {
+            last = std::fs::read_to_string(dir.join(format!("{run}.jsonl")))
+                .ok()
+                .and_then(|log| run_end(&log, harness))
+                .map(|end| harness.run_model_costs(&end, &mut costs))
+                .unwrap_or_default();
+        }
+        last
+    }
+
     pub(crate) fn agent_dir(&self, name: &str) -> PathBuf {
         let dir = home().join("agents").join(name);
         let _ = std::fs::create_dir_all(dir.join("runs"));
@@ -908,6 +924,81 @@ impl Engine {
             stage: crate::config::REVIEW.into(),
             ..NewAgent::default()
         })
+    }
+
+    /// Start a reviewer for a PR that's waiting in the PRs view, and mark
+    /// it dispatched. The row stays `new` if the reviewer can't start.
+    pub fn dispatch_pr(&self, key: &str) -> Result<Agent> {
+        let row = self
+            .store
+            .review_pr(key)?
+            .ok_or_else(|| anyhow!("no PR {key} to review"))?;
+        let what = format!("{}/{}#{}", row.owner, row.repo, row.number);
+        // Claim the row first, so two dispatches never start two reviewers.
+        // `dispatched` with no agent yet means the reviewer is starting.
+        if self
+            .store
+            .set_review_pr_status_if(key, &["new"], "dispatched", None)?
+            == 0
+        {
+            bail!("{what} was already dispatched or dismissed");
+        }
+        let agent = match self.dispatch_review(&row.url) {
+            Ok(agent) => agent,
+            Err(e) => {
+                let _ = self
+                    .store
+                    .set_review_pr_status_if(key, &["dispatched"], "new", None);
+                return Err(e);
+            }
+        };
+        let named = self.store.set_review_pr_status_if(
+            key,
+            &["dispatched"],
+            "dispatched",
+            Some(&agent.name),
+        );
+        if !matches!(named, Ok(1)) {
+            // Dismissed while it started: nothing is left running.
+            let _ = self.remove(&agent.name);
+            bail!("{what} was dismissed while its reviewer started");
+        }
+        Ok(agent)
+    }
+
+    /// Hide a PR from the PRs view. Its reviewer, if it has one, is removed.
+    pub fn dismiss_pr(&self, key: &str) -> Result<()> {
+        let row = self
+            .store
+            .review_pr(key)?
+            .ok_or_else(|| anyhow!("no PR {key} to dismiss"))?;
+        if !row.agent.is_empty() && self.store.agent(&row.agent)?.is_some() {
+            self.remove(&row.agent)?;
+        }
+        self.store.set_review_pr_status(key, "dismissed", None)
+    }
+
+    /// `dispatch_review` for a link you typed: the PR is tracked as dispatched too.
+    pub fn review_url(&self, url: &str) -> Result<Agent> {
+        let agent = self.dispatch_review(url)?;
+        let key = crate::pr_review::key(url);
+        if self.store.review_pr(&key)?.is_none() {
+            let (owner, repo, number) = crate::pr_review::parse(url).unwrap_or_default();
+            self.store.upsert_review_pr(&crate::store::ReviewPr {
+                key: key.clone(),
+                url: crate::pr_review::canonical(url).unwrap_or_else(|| url.to_string()),
+                owner,
+                repo,
+                number: number as i64,
+                source: crate::pr_review::BY_HAND.into(),
+                status: "new".into(),
+                offered_ts: crate::store::now(),
+                ..Default::default()
+            })?;
+        }
+        self.store
+            .set_review_pr_status(&key, "dispatched", Some(&agent.name))?;
+        Ok(agent)
     }
 
     /// Start a reviewer for a PR: a solo agent in its own worktree at the
@@ -1302,6 +1393,11 @@ impl Engine {
             _ => "idle",
         };
         self.store.set_agent(name, "run_state", next)?;
+        let priced = end.as_ref().is_some_and(|e| {
+            harness::of(&agent)
+                .run_cost(e, &mut Costs::default())
+                .is_some()
+        });
         let mut end = end.unwrap_or_default();
         // A CLI that reports each run's own cost (OpenCode) leaves the
         // session's running total to drovr: the stage checkpoint reads it.
@@ -1316,20 +1412,19 @@ impl Engine {
                 end["total_cost_usd"] = json!(total);
             }
         }
-        self.record(
-            name,
-            "run_end",
-            json!({
-                "run": agent.runs,
-                "state": next,
-                "exit": exit,
-                "cost_usd": (total - agent.cost_usd).max(0.0),
-                "duration_ms": end["duration_ms"],
-                "turns": end["num_turns"],
-                "tokens": end["tokens"],
-                "models": end["models"],
-            }),
-        );
+        let event = json!({
+            "run": agent.runs,
+            "state": next,
+            "exit": exit,
+            "cost_usd": (total - agent.cost_usd).max(0.0),
+            "duration_ms": end["duration_ms"],
+            "turns": end["num_turns"],
+            "tokens": end["tokens"],
+            "models": end["models"],
+            "model_costs": self.last_model_costs(&agent),
+        });
+        self.log_spend(&agent, agent.runs, priced, &event);
+        self.record(name, "run_end", event);
         // A stage agent may be asked for a checkpoint, or continued fresh.
         if (next == "idle" || next == "done")
             && self.after_stage_run(&agent, &end, log.as_deref().unwrap_or(""))?
@@ -1872,8 +1967,9 @@ Plan the work, spawn workers with spawn_worker (or coordinate the agents already
     }
 
     /// Add an event to a ticket's record from outside any agent (the
-    /// watcher), in every folder its agents and groups record to. A ticket
-    /// nobody has picked up has no record.
+    /// watcher), in every folder its agents and groups record to, or once
+    /// they're gone, the folder written to last. A ticket nobody has picked
+    /// up has no record.
     pub fn record_ticket(&self, key: &str, kind: &str, data: Value) {
         if !self.cfg.workflow.enabled {
             return;
@@ -1897,6 +1993,9 @@ Plan the work, spawn workers with spawn_worker (or coordinate the agents already
             if ledger::tickets_in(&a.ticket).contains(&key) {
                 folders.insert(folder_of(&a.group_name));
             }
+        }
+        if folders.is_empty() {
+            folders.extend(ledger::latest_folder(&self.cfg, &key));
         }
         let mut event = json!({ "source": "watcher" });
         if let (Some(e), Value::Object(fields)) = (event.as_object_mut(), data) {
@@ -2582,20 +2681,19 @@ Plan the work, spawn workers with spawn_worker (or coordinate the agents already
     fn herdr_end_run(&self, agent: &Agent, state: &str) -> Result<Value> {
         let (mut run, live) = self.herdr_track_cost(&agent.name)?;
         let model = live.as_ref().map(|l| l.model.clone());
-        self.record(
-            &agent.name,
-            "run_end",
-            json!({
-                "run": self.agent(&agent.name)?.runs,
-                "state": state,
-                "exit": null,
-                "cost_usd": run.run_cost,
-                "duration_ms": ((crate::store::now() - run.started) * 1000.0) as i64,
-                "turns": null,
-                "tokens": null,
-                "models": model.filter(|m| !m.is_empty()).map(|m| vec![m]),
-            }),
-        );
+        let n = self.agent(&agent.name)?.runs;
+        let event = json!({
+            "run": n,
+            "state": state,
+            "exit": null,
+            "cost_usd": run.run_cost,
+            "duration_ms": ((crate::store::now() - run.started) * 1000.0) as i64,
+            "turns": null,
+            "tokens": null,
+            "models": model.filter(|m| !m.is_empty()).map(|m| vec![m]),
+        });
+        self.log_spend(agent, n, live.is_some(), &event);
+        self.record(&agent.name, "run_end", event);
         run.run_cost = 0.0;
         self.herdr_save_run(&agent.name, &run)?;
         Ok(json!({
@@ -4247,6 +4345,10 @@ esac
         assert_eq!(ends[0]["state"], "idle");
         assert_eq!(ends[0]["cost_usd"], 0.5);
         assert_eq!(ends[0]["models"], json!(["claude-haiku-5-5"]));
+        let spent = engine.store.spend_since(0.0).unwrap();
+        assert_eq!(spent.len(), 1, "{spent:?}");
+        assert_eq!((spent[0].run, spent[0].cost_usd), (1, Some(0.5)));
+        assert_eq!(spent[0].model, "claude-haiku-5-5");
     }
 
     #[test]
@@ -4334,6 +4436,83 @@ esac
         assert!(calls.contains("pane close w1:p1"), "{calls}");
         assert!(calls.contains("--session-id"), "{calls}");
         assert!(calls.contains("agent prompt w1:p2"), "{calls}");
+    }
+
+    #[test]
+    fn a_run_end_records_what_each_model_cost() {
+        let dir = std::env::temp_dir().join(format!("drovr-model-costs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cfg = Config::default();
+        cfg.workflow.enabled = true;
+        cfg.reports.dir = dir.join("plans").display().to_string();
+        let engine = Engine::with(Store::open(&dir.join("t.db")).unwrap(), cfg, "drovr".into());
+        let name = format!("model-costs-{}", std::process::id());
+        engine
+            .store
+            .add_agent(&Agent {
+                name: name.clone(),
+                role: "solo".into(),
+                backend: "headless".into(),
+                harness: "claude".into(),
+                run_state: "idle".into(),
+                ticket: "SRE-1".into(),
+                ..Agent::default()
+            })
+            .unwrap();
+        let runs = engine.agent_dir(&name).join("runs");
+        let end = |total: f64, models: Value| {
+            json!({ "type": "result", "session_id": "s", "total_cost_usd": total, "modelUsage": models })
+                .to_string()
+        };
+        let logs = [
+            end(1.0, json!({ "claude-opus-5-5": { "costUSD": 1.0 } })),
+            end(
+                1.75,
+                json!({ "claude-haiku-5-5": { "costUSD": 0.25 }, "claude-opus-5-5": { "costUSD": 1.5 } }),
+            ),
+        ];
+        for (i, log) in logs.iter().enumerate() {
+            let run = i as i64 + 1;
+            std::fs::write(runs.join(format!("{run}.jsonl")), log).unwrap();
+            std::fs::write(runs.join(format!("{run}.exit")), "0").unwrap();
+            assert_eq!(engine.store.claim_run(&name).unwrap(), Some(run));
+            engine.finished(&name).unwrap();
+        }
+        let got: Vec<Value> = ledger::timeline(&engine.cfg, "SRE-1")
+            .into_iter()
+            .filter(|e| e["kind"] == "run_end")
+            .map(|e| e["model_costs"].clone())
+            .collect();
+        assert_eq!(
+            got,
+            [
+                json!({ "claude-opus-5-5": 1.0 }),
+                json!({ "claude-haiku-5-5": 0.25, "claude-opus-5-5": 0.5 })
+            ]
+        );
+        let spent: Vec<_> = engine
+            .store
+            .spend_since(0.0)
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.run, r.model, r.cost_usd))
+            .collect();
+        assert_eq!(
+            spent,
+            [
+                (1, "claude-opus-5-5".to_string(), Some(1.0)),
+                (2, "claude-haiku-5-5".to_string(), Some(0.25)),
+                (2, "claude-opus-5-5".to_string(), Some(0.5)),
+            ]
+        );
+        // A killed run reports no cost: it's unknown, not zero.
+        assert_eq!(engine.store.claim_run(&name).unwrap(), Some(3));
+        engine.finished(&name).unwrap();
+        let killed = engine.store.spend_since(0.0).unwrap().pop().unwrap();
+        assert_eq!((killed.run, killed.cost_usd), (3, None));
+        let _ = std::fs::remove_dir_all(engine.agent_dir(&name));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

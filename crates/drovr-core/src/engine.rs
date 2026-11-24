@@ -870,8 +870,11 @@ impl Engine {
                 ..agent.clone()
             }) {
                 self.store.set_agent(&agent.name, "run_state", "error")?;
-                self.store
-                    .set_agent(&agent.name, "status", &format!("herdr start failed: {e}"))?;
+                self.store.set_agent(
+                    &agent.name,
+                    "status",
+                    &format!("herdr start failed: {e:#}"),
+                )?;
                 return Err(e);
             }
         } else {
@@ -2539,9 +2542,23 @@ Plan the work, spawn workers with spawn_worker (or coordinate the agents already
         if self.cfg.herdr.launch.trim().is_empty() {
             return Ok(false);
         }
-        let launch = self.herdr_fill(&self.cfg.herdr.launch, &[]);
-        shell::sh(&launch, None, None, Duration::from_secs(30))?.into_stdout("herdr.launch")?;
         let list = self.herdr_fill(&self.cfg.herdr.list, &[]);
+        // A file lock, not a Mutex: panes open on their own threads and in
+        // agents' MCP servers, and only the first should launch herdr. The
+        // rest wait here, then find it running.
+        let lock = std::fs::File::create(home().join("herdr-launch.lock"))?;
+        lock.lock()?;
+        if shell::sh(&list, None, None, Duration::from_secs(10))?.ok() {
+            return Ok(true);
+        }
+        // Output goes to a file: a `launch` that leaves something in the
+        // background would otherwise hold the pipes open, and drovr with them.
+        let log = home().join("herdr-launch.log");
+        let launch = self.herdr_fill(&self.cfg.herdr.launch, &[]);
+        let script = format!("{{ {launch}\n}} >{} 2>&1", quote(&log.to_string_lossy()));
+        let mut out = shell::sh(&script, None, None, Duration::from_secs(30))?;
+        out.stderr = std::fs::read_to_string(&log).unwrap_or_default();
+        out.into_stdout("herdr.launch")?;
         let until = Instant::now() + HERDR_LAUNCH_WAIT;
         loop {
             // Each check gets only what's left of the wait, so it stays the
@@ -4145,6 +4162,43 @@ esac
             assert!(err.contains(want), "{case}: {err}");
             assert!(!err.contains("requires HERDR_PANE_ID"), "{case}: {err}");
         }
+    }
+
+    #[test]
+    fn panes_opened_at_once_launch_herdr_once_and_dont_wait_on_its_background() {
+        let up = std::env::temp_dir().join(format!("drovr-herdr-once-{}", std::process::id()));
+        let count = up.with_extension("count");
+        let _ = std::fs::remove_file(&up);
+        let _ = std::fs::remove_file(&count);
+        let list = format!(
+            r#"if [ -e {up} ]; then printf '%s' '{{"result":{{"panes":[{{"focused":true,"pane_id":"w1:p1"}}]}}}}'; else echo '{{"error":{{"code":"server_not_running"}}}}' >&2; exit 1; fi"#,
+            up = up.display()
+        );
+        // Leaves a process in the background, as `herdr &` would.
+        let launch = format!(
+            "echo x >> {}; touch {}; sleep 45 &",
+            count.display(),
+            up.display()
+        );
+        let started = Instant::now();
+        let panes: Vec<_> = (0..3)
+            .map(|i| {
+                let mut engine = engine_with_herdr_stub(&format!("once-{i}"), &list, "");
+                engine.cfg.herdr.launch = launch.clone();
+                std::thread::spawn(move || engine.herdr_split_from("/tmp", None))
+            })
+            .collect();
+        for pane in panes {
+            assert_eq!(pane.join().unwrap().unwrap(), "beside-w1:p1");
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(std::fs::read_to_string(&count).unwrap().lines().count(), 1);
+        let _ = std::fs::remove_file(&up);
+        let _ = std::fs::remove_file(&count);
     }
 
     #[test]

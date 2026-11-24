@@ -26,7 +26,7 @@
     </div>
     <input class="grow" bind:value={s.query}
       placeholder={s.source === "ask" ? "e.g. What did #payments decide about refunds last week? Link the Confluence spec." : "Search…"} />
-    <button title="Run it" class="primary" type="submit" disabled={s.loading}>{s.loading ? "Working…" : s.source === "ask" ? "Ask" : "Search"}</button>
+    <button title={s.source === "slack" ? "Search Slack for this" : s.source === "confluence" ? "Search Confluence for this" : "Ask an agent, which answers with all your MCP tools"} class="primary" type="submit" disabled={s.loading}>{s.loading ? "Working…" : s.source === "ask" ? "Ask" : "Search"}</button>
   </form>
   <div class="row share muted">
     Send results to

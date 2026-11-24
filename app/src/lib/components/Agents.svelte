@@ -360,7 +360,7 @@
           {:else if l.kind === "result"}<details class="result" open={hits.includes(i)}><summary>{l.text.split("\n")[0].slice(0, 140) || "(no output)"}</summary><pre>{l.text}</pre></details>
           {:else if l.kind === "final"}<div class="final">{l.text}</div>
           {:else if l.kind === "error"}<pre class="err">{l.text}</pre>
-          {:else if l.kind === "waiting"}<div class="waiting"><span>{l.text}</span> <button onclick={attach}>{app.snap.herdr ? "Open in herdr" : "Copy attach cmd"}</button></div>
+          {:else if l.kind === "waiting"}<div class="waiting"><span>{l.text}</span> <button title={app.snap.herdr ? "Open this agent's session in herdr to answer it" : "Copy a command that attaches to this agent's session"} onclick={attach}>{app.snap.herdr ? "Open in herdr" : "Copy attach cmd"}</button></div>
           {:else}<pre class="raw">{l.text}</pre>{/if}
           </div>
         {:else}

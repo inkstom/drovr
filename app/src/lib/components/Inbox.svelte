@@ -192,7 +192,7 @@
         <div class="muted small">Nothing is posted until you do. drovr runs your <code>jira.{item.payload.action === "comment" ? "comment_cmd" : "transition_cmd"}</code>.</div>
         <div class="row actions">
           <button title={item.payload.action === "comment" ? "Post this comment to the Jira ticket" : "Move the ticket in Jira now, with your transition_cmd"} class="primary" disabled={running[item.id]} onclick={() => postJira(item)}>{running[item.id] ? "Posting…" : "Post to Jira"}</button>
-          <button onclick={() => once(item.id, () => api.dismiss(item.id))}>Discard</button>
+          <button title="Drop this without posting anything to Jira" onclick={() => once(item.id, () => api.dismiss(item.id))}>Discard</button>
         </div>
       {:else if item.kind === "confluence"}
         <h3>{item.title}</h3>

@@ -149,7 +149,7 @@
         <div class="row pick">
           {#if list === "hidden"}<span class="grow"><strong>{t.ticket}</strong><span class="muted small">{did(t)} · {covered(t)}</span></span>
           {:else}<label class="row grow"><input type="checkbox" bind:checked={picked[t.ticket]} /><span><strong>{t.ticket}</strong><span class="muted small">{did(t)} · {covered(t)}</span></span></label>{/if}
-          <button class="ghost small" onclick={() => hide(t, list !== "hidden")}>{list === "hidden" ? "Show" : "Hide"}</button>
+          <button class="ghost small" title={list === "hidden" ? "Put this ticket back in its list" : "Take this ticket out of its list; its record is kept"} onclick={() => hide(t, list !== "hidden")}>{list === "hidden" ? "Show" : "Hide"}</button>
         </div>
       {:else}
         <div class="muted">{tickets.length ? "None." : "No ticket has a record yet."}</div>
@@ -170,7 +170,7 @@
   .prop.done { opacity: .6; }
   .why { font-size: 13px; margin: 2px 0; }
   .small { font-size: 11px; }
-  .link { background: none; border: none; padding: 0; color: var(--accent); font-size: 11px; }
+  .link, .link:hover { background: none; border: none; padding: 0; color: var(--accent); font-size: 11px; }
   .ev { margin: 4px 0 4px 18px; font-size: 12px; }
   pre { font-family: var(--mono); font-size: 12px; white-space: pre-wrap; max-height: 260px; overflow: auto; background: var(--bg); padding: 6px; border-radius: 4px; }
   .picks { max-height: 260px; overflow: auto; margin: 8px 0; }

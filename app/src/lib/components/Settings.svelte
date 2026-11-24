@@ -109,8 +109,8 @@
     {#if remote?.enabled}
       <div class="row">
         <input id="phone-link" readonly value={remote.link} />
-        <button onclick={() => navigator.clipboard.writeText(remote!.link).then(() => toast("Copied. It signs a phone in, so keep it private."))}>Copy link</button>
-        <button onclick={() => (showQr = !showQr)}>{showQr ? "Hide" : "Show"} QR code</button>
+        <button title="Copy the phone page's sign-in link" onclick={() => navigator.clipboard.writeText(remote!.link).then(() => toast("Copied. It signs a phone in, so keep it private."))}>Copy link</button>
+        <button title="A QR code of the link, to scan with your phone" onclick={() => (showQr = !showQr)}>{showQr ? "Hide" : "Show"} QR code</button>
       </div>
       <p class="muted">
         {remote.status ? `The page is ${remote.status}.` : "The page starts when drovr does: restart drovr to start it."}
@@ -125,7 +125,7 @@
   <div class="cli">
     <label for="cli-install">Command line tool</label>
     <div class="row">
-      <button id="cli-install" onclick={installCli} disabled={installing}>{installing ? "Installing…" : cli?.installed ? "Reinstall" : "Install"}</button>
+      <button id="cli-install" title="Put the drovr command on your PATH" onclick={installCli} disabled={installing}>{installing ? "Installing…" : cli?.installed ? "Reinstall" : "Install"}</button>
       <span class="muted">{cli?.installed ? `Installed at ${cli.target}.` : "Not installed."} Also in the drovr menu → Install Command Line Tool…</span>
     </div>
     {#if cli?.shadowed && cli.on_path}

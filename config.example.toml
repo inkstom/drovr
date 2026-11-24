@@ -3,7 +3,7 @@
 
 [defaults]
 backend = "headless"          # "headless" (drovr runs `claude -p`) or "herdr" (interactive panes)
-harness = "claude"            # the CLI agents run with: "claude", or "codex" (experimental, headless only)
+harness = "claude"            # the CLI agents run with: "claude", "opencode", or "codex" (experimental, headless only)
 cwd = "~/code"                # where new agents start when you don't give a directory
 model = ""                    # e.g. "claude-sonnet-5-5"; empty = your Claude Code default
 permission_mode = "acceptEdits"
@@ -11,6 +11,7 @@ worktrees = false             # true = every agent gets its own `git worktree` +
 auto_wake = true              # re-prompt idle agents when a message or answer arrives
 max_budget_usd = 0            # per run; 0 = no cap
 disallowed_tools = []         # e.g. ["Artifact"] to keep reports inside drovr
+# instructions = ["~/.claude/skills/my-rules/SKILL.md"]   # added to every agent's system prompt
 auto_resume = false           # resume headless runs a reboot/crash interrupted, without asking
 your_name = ""                # what agents call you ("Notes from Izz", ask_izz); empty = "the human" and ask_human
 cost_warning_usd = 10         # flag an agent in the app once its runs cost more than this; 0 = off
@@ -19,6 +20,12 @@ copy_on_select = true         # selecting text in an agent's output copies it
 [claude]
 command = "claude"
 extra_args = []               # e.g. ["--add-dir", "~/code/shared"]
+
+[opencode]                    # agents with harness = "opencode" (OpenCode 2)
+command = "opencode"
+model = ""                    # "provider/model" as `opencode models` lists it; empty = OpenCode's default
+agent = ""                    # the OpenCode agent to run as; empty = its default agent
+extra_args = []               # added to headless runs only
 
 [codex]                       # agents with harness = "codex" (experimental)
 command = "codex"
@@ -56,8 +63,10 @@ dispatch_transition = ""      # when you dispatch a ticket, make this move strai
 
 [watch.rules]                 # wake the agent, ask you in the Inbox, or ignore (it's still recorded)
 ci_failed = "wake"            # with the failing log
+ci_passed = "wake"            # checks went from pending or failing to passing
 changes_requested = "wake"    # with the reviews and review comments
-new_review = "wake"
+new_review = "wake"           # fires for each review
+ready_for_review = "ask"      # green, mergeable, no review decision yet
 conflict = "wake"
 approved_green = "ask"        # ready to merge
 merged = "ask"                # plus Jira drafts
@@ -69,14 +78,30 @@ order = ["triage", "research", "blueprint", "build", "close"]
 build_checkpoint_tokens = 150000   # the build stage checkpoints and starts a fresh session past this much context (0 = off)
 build_checkpoint_usd = 15          # ...or once its session has cost this much (0 = off)
 tidy_on_close = true               # remove stopped stage agents when the last handoff is approved
+review = false                     # pair each build agent with a reviewer that can't edit files and proposes diffs to it
+review_skill = ""                  # a SKILL.md the build reviewers and PR reviewers follow, e.g. "~/.claude/skills/code-review/SKILL.md"
 
-[retro]                       # a retro you start from a ticket's timeline or Pipeline
+# [review]                      # PRs to review, from Slack links and team review requests; offered in the Inbox once each
+# slack_channels = ["#sre-reviews"]
+# github_teams = ["my-org/sre"]  # org/team
+# poll_secs = 600               # 0 = off; needs a channel or a team
+# auto_dispatch = false         # true: start the reviewer without asking
+# remove_when_closed = true     # remove a reviewer that isn't working, and its worktree, once its PR merges or closes
+# repos_dir = ""                # local clones live at <repos_dir>/<repo>; empty = defaults.cwd
+# owners = []                   # only review PRs in these GitHub orgs or users; empty = any
+
+[retro]                       # a retro you start from a ticket's timeline or Insights
 model = ""                    # the retro agent's model; empty = the default
 skills_dir = "~/.claude/skills"   # where approved skill proposals are written
+hide_decided = true           # hide a ticket from the picker once its retros are decided, until new work
+
+[insights]
+weekly_target_usd = 0         # what you mean to spend in a week, shown beside the average in Insights; 0 = none
 
 [stages.models]               # the model each stage runs on; unset = the default
 # triage = "claude-haiku-5-5"
 # blueprint = "claude-opus-5-5"
+# review = "claude-opus-5-5"   # build reviewers (with stages.review on) and PR reviewers
 
 [permissions]
 # Headless agents use these without asking; everything else shows up in the Inbox.
@@ -98,7 +123,7 @@ command = "herdr"
 split = "{herdr} pane split --current --direction right --cwd {cwd} --no-focus"
 agent_pane = "{herdr} tab create --cwd {cwd} --label {name} --no-focus"
 list = "{herdr} pane list"
-start = "{herdr} agent start {name} --kind claude --pane {pane} --timeout 60000 -- {args}"
+start = "{herdr} agent start {name} --kind {kind} --pane {pane} --timeout 60000 -- {args}"   # {kind}: claude or opencode
 run = "{herdr} pane run {pane} {cmd}"
 prompt = "{herdr} agent prompt {target} {text}"
 read = "{herdr} agent read {target} --source recent-unwrapped --lines {lines}"
@@ -157,6 +182,10 @@ dir = ""                      # an auto memory folder every Claude Code agent re
 
 [reports]
 dir = "~/.claude/plans"       # HTML reports; a group's go in <dir>/<group>/
+archive_after_days = 0        # move plans untouched this long into <dir>/archive/; 0 = never
+
+[inbox]
+keep_days = 0                 # remove resolved Inbox items older than this; 0 = never
 
 [terminal]                    # the terminal panel (⌃`) under an agent's output
 shell = ""                    # empty: $SHELL, else /bin/zsh; runs as a login shell

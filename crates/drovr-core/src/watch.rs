@@ -12,6 +12,7 @@
 
 use crate::engine::Engine;
 use crate::ledger;
+use crate::quota::{self, Hold};
 use crate::shell::{self, quote};
 use crate::sources::{adf_text, issue_fields, name_of, Sources};
 use anyhow::{anyhow, Result};
@@ -66,6 +67,14 @@ pub struct Pr {
     pub updated: String,
     /// How many reviews it has had.
     pub reviews: u64,
+    pub branch: String,
+    /// When it was opened, and merged or closed; 0 if it isn't known.
+    pub created: f64,
+    pub closed: f64,
+    /// How many of its heads others than its author reviewed.
+    pub review_rounds: u64,
+    /// Added and deleted.
+    pub lines: u64,
     /// What `watch.rules` already acted on, as `trigger@head`.
     pub fired: Vec<String>,
 }
@@ -76,6 +85,8 @@ pub struct Pr {
 pub struct Checked {
     pub at: f64,
     pub error: String,
+    /// Waiting on GitHub's API quota (never Jira).
+    pub hold: Hold,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -138,8 +149,17 @@ fn poll_at(engine: &Engine, force: bool, file: &std::path::Path) -> State {
     } else {
         cfg.pr_poll_secs
     };
-    if force || now - state.github.at >= every as f64 {
-        poll_github(engine, &mut state);
+    let due = now - state.github.at >= every as f64 && now >= state.github.hold.until;
+    if force || due {
+        let (go, hold) = if cfg.github_repos.is_empty() {
+            (true, Hold::default())
+        } else {
+            quota::gate(&cfg.gh, state.github.at, every as f64, force)
+        };
+        state.github.hold = hold;
+        if go {
+            poll_github(engine, &mut state);
+        }
     }
     if let Err(e) = save(&state, file) {
         eprintln!("drovr: couldn't save the watcher's state: {e:#}");
@@ -352,17 +372,19 @@ fn poll_github(engine: &Engine, state: &mut State) {
             }
         }
     }
-    // Open PRs the search no longer returns (past its 100 results or its
-    // 30 days) are still followed, and looked at each time: without the
-    // search there's nothing to say they changed.
+    // PRs the search no longer returns (past its 100 results or its 30
+    // days) are still followed while their ticket is: open ones are looked
+    // at each time, since without the search there's nothing to say they
+    // changed. Merged and closed ones are kept as they are, so they aren't
+    // linked again, and their history isn't lost, when the search finds
+    // them again.
     let mut unsearched = BTreeSet::new();
     for (url, old) in &state.prs {
-        if !found.contains_key(url)
-            && old.state == "OPEN"
-            && old.tickets.iter().any(|k| keys.contains(k))
-        {
+        if !found.contains_key(url) && old.tickets.iter().any(|k| keys.contains(k)) {
             found.insert(url.clone(), old.clone());
-            unsearched.insert(url.clone());
+            if old.state == "OPEN" {
+                unsearched.insert(url.clone());
+            }
         }
     }
     let mut now = BTreeMap::new();
@@ -383,7 +405,7 @@ fn poll_github(engine: &Engine, state: &mut State) {
         };
         if look {
             let cmd = format!(
-                "{gh} pr view {} --json state,isDraft,mergeable,reviewDecision,statusCheckRollup,headRefOid,updatedAt,title,reviews",
+                "{gh} pr view {} --json state,isDraft,mergeable,reviewDecision,statusCheckRollup,headRefOid,updatedAt,title,reviews,author,headRefName,createdAt,closedAt,additions,deletions",
                 quote(&url)
             );
             if let Some(b) = before {
@@ -403,6 +425,9 @@ fn poll_github(engine: &Engine, state: &mut State) {
                 tickets: pr.tickets,
                 ..b.clone()
             };
+        }
+        if look {
+            engine.observe_pr(before, &pr, baseline);
         }
         if !baseline {
             for (kind, data) in pr_changes(before, &pr) {
@@ -469,7 +494,19 @@ pub fn apply_view(pr: &mut Pr, v: &Value) {
     (pr.ci, pr.failing, pr.failing_urls) = checks(&v["statusCheckRollup"]);
     if let Some(r) = v["reviews"].as_array() {
         pr.reviews = r.len() as u64;
+        let author = &v["author"]["login"];
+        let heads: BTreeSet<&str> = r
+            .iter()
+            .filter(|r| r["author"]["login"] != *author)
+            .filter_map(|r| r["commit"]["oid"].as_str())
+            .collect();
+        pr.review_rounds = heads.len() as u64;
     }
+    let time = |k: &str| v[k].as_str().and_then(crate::outcomes::parse_iso);
+    pr.branch = v["headRefName"].as_str().unwrap_or("").to_string();
+    pr.created = time("createdAt").unwrap_or(0.0);
+    pr.closed = time("closedAt").unwrap_or(0.0);
+    pr.lines = v["additions"].as_u64().unwrap_or(0) + v["deletions"].as_u64().unwrap_or(0);
 }
 
 /// The overall state of a PR's checks: check runs (status, conclusion) and
@@ -709,6 +746,200 @@ mod tests {
         assert!(ledger::timeline(&engine.cfg, "SRE-3229")
             .iter()
             .any(|e| e["kind"] == "pr_merged" && e["number"] == 8));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn fake_watch(
+        tag: &str,
+    ) -> (
+        Engine,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        impl Fn(&str, &str),
+    ) {
+        let dir = std::env::temp_dir().join(format!("drovr-watch-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.display();
+        let write = {
+            let dir = dir.clone();
+            move |name: &str, text: &str| std::fs::write(dir.join(name), text).unwrap()
+        };
+        write(
+            "sprint.json",
+            r#"{"issues":[{"key":"SRE-3229","summary":"Kinds","status":{"name":"To do","statusCategory":{"key":"indeterminate"}},"updated":"u1"}]}"#,
+        );
+        write(
+            "issue.json",
+            r#"{"data":[{"key":"SRE-3229","comment":{"total":0,"comments":[]}}]}"#,
+        );
+        write("search.json", "[]");
+        write("view.json", "{}");
+        write("gh", &format!("#!/bin/sh\ncase \"$1\" in search) cat {d}/search.json;; pr) cat {d}/view.json;; api) cat {d}/rate.json;; esac\n"));
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.join("gh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut cfg = Config::default();
+        cfg.workflow.enabled = true;
+        cfg.reports.dir = dir.join("plans").display().to_string();
+        cfg.jira.provider = "command".into();
+        cfg.jira.search_cmd = format!("cat {d}/sprint.json #{{query}}");
+        cfg.jira.get_cmd = format!("cat {d}/issue.json #{{key}}");
+        cfg.watch.github_repos = vec!["o/*".into()];
+        cfg.watch.gh = dir.join("gh").display().to_string();
+        let engine = Engine::with(Store::open(&dir.join("t.db")).unwrap(), cfg, "drovr".into());
+        engine
+            .store
+            .add_group("wif", "", "SRE-3229", "/tmp", "", false)
+            .unwrap();
+        let file = dir.join("watch.json");
+        (engine, dir, file, write)
+    }
+
+    const PR7: &str = "https://github.com/o/r/pull/7";
+
+    fn search_pr7(state: &str, updated: &str) -> String {
+        format!(
+            r#"[{{"number":7,"title":"feat(SRE-3229): kinds","url":"{PR7}","repository":{{"nameWithOwner":"o/r"}},"state":"{state}","isDraft":false,"updatedAt":"{updated}"}}]"#
+        )
+    }
+
+    fn rate(graphql: u32) -> String {
+        format!(
+            r#"{{"resources":{{"core":{{"limit":5000,"remaining":0,"reset":9999999999}},"graphql":{{"limit":5000,"remaining":{graphql},"reset":9999999999}}}}}}"#
+        )
+    }
+
+    #[test]
+    fn an_empty_quota_pauses_github_but_not_jira() {
+        let (engine, dir, file, write) = fake_watch("quota-empty");
+        write("search.json", &search_pr7("open", "p1"));
+        write("rate.json", &rate(0));
+        let s = poll_at(&engine, true, &file);
+        assert_eq!(s.tickets["SRE-3229"].status, "To do");
+        assert!(s.prs.is_empty());
+        assert_eq!(s.github.at, 0.0);
+        assert!(s.github.hold.paused);
+        assert_eq!(s.github.hold.until, 9999999999.0);
+
+        // The quota's back: a forced poll reads it again and clears the hold.
+        write("rate.json", &rate(5000));
+        let s = poll_at(&engine, true, &file);
+        assert!(s.prs.contains_key(PR7));
+        assert_eq!(s.github.hold, Hold::default());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_hold_keeps_the_timer_from_polling_github() {
+        let (engine, dir, file, write) = fake_watch("quota-hold");
+        write("search.json", &search_pr7("open", "p1"));
+        write("rate.json", &rate(5000));
+        write(
+            "watch.json",
+            r#"{"github":{"at":1,"hold":{"until":9999999999,"paused":true}}}"#,
+        );
+        assert!(poll_at(&engine, false, &file).prs.is_empty());
+        write(
+            "watch.json",
+            r#"{"github":{"at":1,"hold":{"until":5,"paused":true}}}"#,
+        );
+        assert!(poll_at(&engine, false, &file).prs.contains_key(PR7));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_merged_pr_the_search_misses_keeps_its_history() {
+        let (engine, dir, file, write) = fake_watch("merged-kept");
+        let count = |kind: &str| {
+            ledger::timeline(&engine.cfg, "SRE-3229")
+                .iter()
+                .filter(|e| e["kind"] == kind)
+                .count()
+        };
+        poll_at(&engine, true, &file);
+
+        write("search.json", &search_pr7("open", "p1"));
+        write(
+            "view.json",
+            r#"{"state":"OPEN","mergeable":"MERGEABLE","reviewDecision":"","headRefOid":"a1","statusCheckRollup":[]}"#,
+        );
+        poll_at(&engine, true, &file);
+        assert_eq!(count("pr_linked"), 1);
+
+        write("search.json", &search_pr7("merged", "p2"));
+        write(
+            "view.json",
+            r#"{"state":"MERGED","headRefOid":"a1","statusCheckRollup":[],"updatedAt":"p2"}"#,
+        );
+        let s = poll_at(&engine, true, &file);
+        assert_eq!(count("pr_merged"), 1);
+        let fired = s.prs[PR7].fired.clone();
+        assert!(fired.iter().any(|f| f.starts_with("merged@")), "{fired:?}");
+
+        write("search.json", "[]");
+        let s = poll_at(&engine, true, &file);
+        assert_eq!(s.prs[PR7].state, "MERGED");
+        assert_eq!(s.prs[PR7].fired, fired);
+
+        write("search.json", &search_pr7("merged", "p2"));
+        let s = poll_at(&engine, true, &file);
+        assert_eq!(s.prs[PR7].fired, fired);
+        assert_eq!(count("pr_linked"), 1);
+        assert_eq!(count("pr_merged"), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_pr_is_followed_to_its_outcome() {
+        let (engine, dir, file, write) = fake_watch("outcome");
+        poll_at(&engine, true, &file);
+        let created = ledger::iso(crate::store::now() - 30.0);
+        let view = |state: &str, head: &str, closed: &str| {
+            format!(
+                r#"{{"state":"{state}","isDraft":false,"mergeable":"MERGEABLE","headRefOid":"{head}","statusCheckRollup":[],"updatedAt":"{head}{state}","author":{{"login":"me"}},"headRefName":"feat","createdAt":"{created}","closedAt":{closed},"additions":30,"deletions":12,"reviews":[
+                {{"author":{{"login":"me"}},"commit":{{"oid":"a"}}}},{{"author":{{"login":"bot"}},"commit":{{"oid":"a"}}}},{{"author":{{"login":"you"}},"commit":{{"oid":"a"}}}},{{"author":{{"login":"bot"}},"commit":{{"oid":"b"}}}}]}}"#
+            )
+        };
+        write("search.json", &search_pr7("open", "p1"));
+        write("view.json", &view("OPEN", "a", "null"));
+        poll_at(&engine, true, &file);
+        write("search.json", &search_pr7("open", "p2"));
+        write("view.json", &view("OPEN", "b", "null"));
+        poll_at(&engine, true, &file);
+        write("search.json", &search_pr7("merged", "p3"));
+        write(
+            "view.json",
+            &view("MERGED", "b", "\"2030-01-01T00:00:00Z\""),
+        );
+        poll_at(&engine, true, &file);
+        let got = engine.store.outcomes().unwrap();
+        assert_eq!(got.len(), 1);
+        let o = &got[0];
+        assert!(o.whole);
+        assert_eq!((o.pushes, o.rounds, o.lines), (1, Some(2), Some(42)));
+        assert_eq!(o.ready, crate::outcomes::parse_iso(&created));
+        assert_eq!((o.state.as_str(), o.closed), ("MERGED", Some(1893456000.0)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_pr_whose_ticket_left_the_jql_is_dropped() {
+        let (engine, dir, file, write) = fake_watch("ticket-left");
+        write("search.json", &search_pr7("closed", "p1"));
+        write(
+            "view.json",
+            r#"{"state":"CLOSED","headRefOid":"a1","statusCheckRollup":[]}"#,
+        );
+        let s = poll_at(&engine, true, &file);
+        assert_eq!(s.prs[PR7].state, "CLOSED");
+
+        write(
+            "sprint.json",
+            r#"{"issues":[{"key":"SRE-1","summary":"Other","status":{"name":"To do","statusCategory":{"key":"indeterminate"}},"updated":"u1"}]}"#,
+        );
+        write("search.json", "[]");
+        let s = poll_at(&engine, true, &file);
+        assert!(!s.prs.contains_key(PR7), "{:?}", s.prs.keys());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

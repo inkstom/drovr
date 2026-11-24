@@ -1,5 +1,113 @@
 # Changelog
 
+## [0.17.1](https://github.com/izz-linux/drovr/compare/v0.17.0...v0.17.1) (2026-11-24)
+
+
+### Bug Fixes
+
+* leave retros with no logged cost out of the average ([#102](https://github.com/izz-linux/drovr/issues/102)) ([43f5dae](https://github.com/izz-linux/drovr/commit/43f5daee977b2d5cfd7a108469080c596d216f49))
+* show spend by day in Insights ([#103](https://github.com/izz-linux/drovr/issues/103)) ([6e0424d](https://github.com/izz-linux/drovr/commit/6e0424da887406311ec015a78cb957c75441defb))
+
+## [0.17.0](https://github.com/izz-linux/drovr/compare/v0.16.2...v0.17.0) (2026-11-24)
+
+
+### Features
+
+* back off polling as GitHub's API quota runs low ([#90](https://github.com/izz-linux/drovr/issues/90)) ([8b7f2b8](https://github.com/izz-linux/drovr/commit/8b7f2b8c385b56feeb8a5c2b9d221c9d5c91b287))
+* compare models on what became of their PRs ([#99](https://github.com/izz-linux/drovr/issues/99)) ([f17d0db](https://github.com/izz-linux/drovr/commit/f17d0db5d39890797fe9e0b1035636221c53ac40))
+* give every theme chart colors ([#97](https://github.com/izz-linux/drovr/issues/97)) ([3a7fa69](https://github.com/izz-linux/drovr/commit/3a7fa695daae356da3a01e1a524761ddd382da60))
+* log what every run costs ([#96](https://github.com/izz-linux/drovr/issues/96)) ([22cd6ae](https://github.com/izz-linux/drovr/commit/22cd6ae2afdbc191b8d8e9a7ce7436100f68cb45))
+* move retros to Insights and hide covered tickets ([#101](https://github.com/izz-linux/drovr/issues/101)) ([f92f78c](https://github.com/izz-linux/drovr/commit/f92f78c3e1161287bdc4117b8d58f648640df81d))
+* show what runs cost in Insights ([#98](https://github.com/izz-linux/drovr/issues/98)) ([6403e64](https://github.com/izz-linux/drovr/commit/6403e6464d242919f4583ed36824053b875bf739))
+
+
+### Bug Fixes
+
+* record each model's cost and count a model under one name ([#93](https://github.com/izz-linux/drovr/issues/93)) ([a5de86b](https://github.com/izz-linux/drovr/commit/a5de86b86dc91e7cb6e93246eeaa5161d30dbcbb))
+* record retros and PR changes on tickets with no live agents ([#92](https://github.com/izz-linux/drovr/issues/92)) ([5c46f25](https://github.com/izz-linux/drovr/commit/5c46f256b1cf49ecc7eb170b22253474de7a8929))
+* send builders every unresolved review thread ([#94](https://github.com/izz-linux/drovr/issues/94)) ([cec9296](https://github.com/izz-linux/drovr/commit/cec92965c16317863a006c5cdfe3ecf05b60809b))
+
+## [0.16.2](https://github.com/izz-linux/drovr/compare/v0.16.1...v0.16.2) (2026-11-19)
+
+
+### Bug Fixes
+
+* list Settings last in the sidebar, after Pipeline ([#88](https://github.com/izz-linux/drovr/issues/88)) ([17a9b45](https://github.com/izz-linux/drovr/commit/17a9b452855a7e402075736b456c4c9b4fa8aa95))
+
+## [0.16.1](https://github.com/izz-linux/drovr/compare/v0.16.0...v0.16.1) (2026-11-19)
+
+
+### Bug Fixes
+
+* re-offer a dismissed PR when it's posted in a watched channel ([#86](https://github.com/izz-linux/drovr/issues/86)) ([0fce43f](https://github.com/izz-linux/drovr/commit/0fce43f974941d0bf4235c5f0904ce4067eabc5f))
+
+## [0.16.0](https://github.com/izz-linux/drovr/compare/v0.15.1...v0.16.0) (2026-11-19)
+
+
+### Features
+
+* add a PRs view for PRs waiting on your review ([#85](https://github.com/izz-linux/drovr/issues/85)) ([e85e1b7](https://github.com/izz-linux/drovr/commit/e85e1b7a26c073597d43c979483bdcb71efee79a))
+
+
+### Bug Fixes
+
+* keep a working PATH when the login shell is slow after a reboot ([#83](https://github.com/izz-linux/drovr/issues/83)) ([d01134d](https://github.com/izz-linux/drovr/commit/d01134d5e34b6f23f58edf58af1f03a66ac1551c))
+
+## [0.15.1](https://github.com/izz-linux/drovr/compare/v0.15.0...v0.15.1) (2026-11-19)
+
+
+### Bug Fixes
+
+* install the drovr CLI on your PATH from the app ([#81](https://github.com/izz-linux/drovr/issues/81)) ([d1a3f46](https://github.com/izz-linux/drovr/commit/d1a3f460de3cc2e9cc5accc4e3b64269afe12488))
+
+## [0.15.0](https://github.com/izz-linux/drovr/compare/v0.14.1...v0.15.0) (2026-11-19)
+
+
+### Features
+
+* add gold lettering themes ([#74](https://github.com/izz-linux/drovr/issues/74)) ([5ddf2b5](https://github.com/izz-linux/drovr/commit/5ddf2b5ff7ad48546819670dec06789386d3bd3e))
+* add standing instructions to every agent's system prompt ([#76](https://github.com/izz-linux/drovr/issues/76)) ([ce8f7ae](https://github.com/izz-linux/drovr/commit/ce8f7ae97a1503dd963451d0db798836e43c8127))
+* archive old plans and prune resolved Inbox items ([#78](https://github.com/izz-linux/drovr/issues/78)) ([676fc4c](https://github.com/izz-linux/drovr/commit/676fc4c2e356f0fbc4c23ff183d688582d212f0c))
+* offer PRs from Slack and team review requests to a read-only reviewer ([#79](https://github.com/izz-linux/drovr/issues/79)) ([988b06b](https://github.com/izz-linux/drovr/commit/988b06b35eb7bc76f018cce2d5ecb9ae14b45bf6))
+
+
+### Bug Fixes
+
+* wake on green CI and flag PRs waiting on review ([#75](https://github.com/izz-linux/drovr/issues/75)) ([d2e2204](https://github.com/izz-linux/drovr/commit/d2e2204eabf20bd92eca503b316101983366d2e0))
+
+## [0.14.1](https://github.com/izz-linux/drovr/compare/v0.14.0...v0.14.1) (2026-11-18)
+
+
+### Bug Fixes
+
+* wrap code blocks in agent messages instead of scrolling them ([#72](https://github.com/izz-linux/drovr/issues/72)) ([a800ac7](https://github.com/izz-linux/drovr/commit/a800ac7989be0875333674fcab03f88057800a77))
+
+## [0.14.0](https://github.com/izz-linux/drovr/compare/v0.13.0...v0.14.0) (2026-11-17)
+
+
+### Features
+
+* show herdr agents' sessions like headless ones ([#64](https://github.com/izz-linux/drovr/issues/64)) ([c51a9aa](https://github.com/izz-linux/drovr/commit/c51a9aaa2b9c72a01e32732fc4e47cbab329f0b5))
+
+
+### Bug Fixes
+
+* let OpenCode agents edit the plans folder without asking ([#70](https://github.com/izz-linux/drovr/issues/70)) ([ed7f286](https://github.com/izz-linux/drovr/commit/ed7f2869806b2729ff9fd3f47068c10a5758fa8c))
+
+## [0.13.0](https://github.com/izz-linux/drovr/compare/v0.12.0...v0.13.0) (2026-11-17)
+
+
+### Features
+
+* pair build agents with a reviewer ([#68](https://github.com/izz-linux/drovr/issues/68)) ([87f37b7](https://github.com/izz-linux/drovr/commit/87f37b7d1b538c442458e2f56047afb197468616))
+
+## [0.12.0](https://github.com/izz-linux/drovr/compare/v0.11.3...v0.12.0) (2026-11-17)
+
+
+### Features
+
+* add OpenCode as an agent harness ([#63](https://github.com/izz-linux/drovr/issues/63)) ([e4d84bc](https://github.com/izz-linux/drovr/commit/e4d84bccaed118303204c9c27294107e3dd45fe9))
+
 ## [0.11.3](https://github.com/izz-linux/drovr/compare/v0.11.2...v0.11.3) (2026-11-15)
 
 

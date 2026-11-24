@@ -1,16 +1,22 @@
 //! drovr core: shared state, agent lifecycle, the coordination MCP server,
 //! and Jira / Confluence / Slack lookups. Used by the desktop app and the CLI.
 
+pub mod cleanup;
 pub mod config;
 pub mod confluence;
 pub mod datadog;
 pub mod engine;
 pub mod harness;
+pub mod insights;
 pub mod ledger;
 pub mod mcp;
 pub mod memory;
+pub mod models;
+pub mod outcomes;
+pub mod pr_review;
 pub mod prompts;
 pub mod push;
+pub mod quota;
 pub mod remote;
 pub mod reports;
 pub mod retro;
@@ -19,6 +25,7 @@ pub mod rules;
 pub mod sessions;
 pub mod shell;
 pub mod sources;
+pub mod spend;
 pub mod stages;
 pub mod store;
 pub mod watch;

@@ -12,6 +12,30 @@ export type Agent = {
   /** Your messages it hasn't read yet. */
   queued: Message[];
 };
+/** Runs and what they cost; `cost` leaves out the `unpriced` ones. */
+export type InsightsTotal = { cost: number; runs: number; unpriced: number };
+export type InsightsPart = InsightsTotal & { name: string };
+export type InsightsWeek = InsightsTotal & { start: number; by_harness: InsightsPart[]; retros: number[] };
+export type Insights = {
+  weeks: InsightsWeek[]; total: InsightsTotal;
+  by_stage: InsightsPart[]; by_harness: InsightsPart[]; by_model: InsightsPart[]; by_ticket: InsightsPart[];
+  week_average: number | null; retro_average: number | null; weekly_target_usd: number;
+};
+/** How PRs of one size, built by one model, turned out. */
+export type ModelRow = {
+  size: "small" | "medium" | "large" | "unknown"; model: string; reviewed: boolean; prs: number;
+  /** Enough PRs to compare. */
+  enough: boolean;
+  /** A PR's average cost before rework, and in it. */
+  first: number; rework: number; unpriced: number; reworked: number;
+  /** Medians; null when nothing says. */
+  hours: number | null; rounds: number | null;
+};
+export type InsightsModels = {
+  rows: ModelRow[]; merged: number; whole: number; reworked: number; hours: number | null;
+  /** Merged PRs the rows leave out, by why. */
+  left_out: Record<string, number>;
+};
 export type Group = {
   name: string; goal: string; ticket: string; cwd: string; plans_dir: string; created: number;
   /** Created with the ticket workflow on: its lead runs the ticket in stages. */
@@ -19,10 +43,12 @@ export type Group = {
 };
 export type NewGroup = { name: string; goal: string; ticket: string; cwd: string; backend: string; harness: string; plans_dir: string; lead: boolean; model?: string };
 export type Defaults = {
-  cwd: string; backend: string; harness: string; model: string; codex_model: string; permission_mode: string; worktrees: boolean; plans_dir: string; your_name: string;
+  cwd: string; backend: string; harness: string; model: string; codex_model: string; opencode_model: string; permission_mode: string; worktrees: boolean; plans_dir: string; your_name: string;
   notify: boolean; cost_warning_usd: number; copy_on_select: boolean;
   /** workflow.enabled: the ticket record and timeline are on. */
   workflow: boolean;
+  /** [review] has a Slack channel or a GitHub team: the PRs view shows. */
+  review_enabled: boolean;
   /** jira.ticket_skill: how agents write a ticket for their own task. */
   ticket_skill: string;
 };
@@ -31,7 +57,24 @@ export type Item = {
   id: number; ts: number; agent: string; kind: string; title: string; body: string;
   options: string[]; payload: any; status: string; answer: string; delivered: boolean;
 };
-export type Snapshot = { agents: Agent[]; groups: Group[]; inbox: Item[]; recent: Item[]; unseen_reports: number; herdr: boolean; codex: boolean };
+/** A PR waiting on your review. `status` is new or dispatched here (the snapshot lists open rows only). */
+export type ReviewPr = {
+  key: string; url: string; owner: string; repo: string; number: number; title: string; author: string;
+  /** `#channel`, or `team org/slug`. */
+  source: string; permalink: string; poster: string;
+  status: "new" | "dispatched" | "dismissed" | "closed";
+  /** Empty while status is dispatched means the reviewer is still starting. */
+  agent: string;
+  offered_ts: number; decided_ts: number; checked_ts: number;
+  pr_state: string;
+  /** success | failure | pending | none */
+  ci: string;
+  review_decision: string;
+  /** APPROVED, CHANGES_REQUESTED, COMMENTED or empty. */
+  my_review: string;
+  draft: boolean;
+};
+export type Snapshot = { agents: Agent[]; groups: Group[]; inbox: Item[]; recent: Item[]; review_prs: ReviewPr[]; unseen_reports: number; herdr: boolean; codex: boolean; opencode: boolean };
 export type ReportFile = { path: string; folder: string; title: string; modified: number; agent: string; summary: string; seen: boolean };
 export type Line = { kind: string; text: string };
 export type Message = { id: number; ts: number; sender: string; recipient: string; group_name: string; body: string };
@@ -50,14 +93,21 @@ export type WatchedPr = {
   url: string; repo: string; number: number; title: string; tickets: string[]; state: string; draft: boolean;
   ci: string; failing: string[]; failing_urls: string[]; review: string; mergeable: string; head: string; updated: string;
 };
+/** Polling that's waiting on GitHub's API quota: until when (0: it isn't), and whether the last poll was skipped. */
+export type Hold = { until: number; paused: boolean };
 export type WatchState = {
-  jira: { at: number; error: string }; github: { at: number; error: string };
+  jira: { at: number; error: string }; github: { at: number; error: string; hold: Hold };
   tickets: Record<string, SprintTicket>; prs: Record<string, WatchedPr>;
 };
 /** One thing a retro proposes, with its evidence and what you decided. */
 export type Proposal = {
   id: string; kind: string; title: string; why: string; evidence: string[]; change: any;
   status: "pending" | "approved" | "dismissed"; result: string;
+};
+/** A ticket a retro can be run on; `runs`, `cost` and `merged` are since its last retro. */
+export type RetroTicket = {
+  ticket: string; list: "not_covered" | "new_work" | "covered" | "hidden"; retros: number[]; last_work: number;
+  runs: number; cost: number; merged: number;
 };
 export type Retro = { dir: string; tickets: string[]; started: number; agent: string; note: string; proposals: Proposal[] };
 export type Note = { key: string; value: string; author: string; ts: number };
@@ -94,15 +144,21 @@ export type NewAgent = {
 };
 export type ClaudeSession = { id: string; cwd: string; first_prompt: string; modified: number };
 
+export interface CliStatus { installed: boolean; target: string; points_to: string | null; on_path: string | null; shadowed: boolean }
+
+export interface LoginPathInfo { source: "interactive" | "login" | "saved" | "system" | "kept" | "pending"; ms: number; error: string | null; path: string; shell: string }
+
 export const api = {
   snapshot: () => invoke<Snapshot>("snapshot"),
-  output: (name: string, lines = 600) => invoke<Line[]>("agent_output", { name, lines }),
+  /** `pane`: a herdr agent's pane as it is on screen, not its session's record. */
+  output: (name: string, lines = 600, pane = false) => invoke<Line[]>("agent_output", { name, lines, pane }),
   newAgent: (spec: NewAgent) => invoke<Agent>("new_agent", { spec }),
   createGroup: (spec: NewGroup) => invoke<Agent | null>("create_group", { spec }),
   addLead: (group: string, goal: string, backend: string, harness = "") => invoke<Agent>("add_lead", { group, goal, backend, harness }),
   defaults: () => invoke<Defaults>("defaults"),
-  claudeSessions: () => invoke<ClaudeSession[]>("claude_sessions"),
-  findSession: (id: string) => invoke<ClaudeSession | null>("find_session", { id }),
+  /** Recent saved sessions of a harness (claude or opencode). */
+  sessions: (harness: string) => invoke<ClaudeSession[]>("sessions", { harness }),
+  findSession: (id: string, harness: string) => invoke<ClaudeSession | null>("find_session", { id, harness }),
   plansFolders: () => invoke<PlansFolder[]>("plans_folders"),
   readPrompt: (folder: string, file: string) => invoke<string>("read_prompt", { folder, file }),
   prompt: (name: string, text: string) => invoke<string>("prompt_agent", { name, text }),
@@ -132,6 +188,11 @@ export const api = {
   termClose: (key: string) => invoke<void>("term_close", { key }),
   markRan: (id: number, note: string) => invoke<void>("inbox_mark_ran", { id, note }),
   dismiss: (id: number) => invoke<void>("inbox_dismiss", { id }),
+  prDispatch: (key: string) => invoke<void>("pr_dispatch", { key }),
+  prDismiss: (key: string) => invoke<void>("pr_dismiss", { key }),
+  /** A forced poll: look for new PRs and refresh the open ones now. */
+  prRefresh: () => invoke<void>("pr_refresh"),
+  prHold: () => invoke<Hold>("pr_hold"),
   runCommand: (id: number, target: string, command: string) => invoke<string>("run_command", { id, target, command }),
   bus: (group: string) => invoke<{ messages: Message[]; notes: Note[] }>("bus", { group }),
   send: (to: string, group: string, body: string) => invoke<void>("send_message", { to, group, body }),
@@ -150,6 +211,10 @@ export const api = {
     invoke<PushPreview>("push_preview", { command, cwd, namedCwd }),
   pushGithubMoved: (root: string, branch: string, tracking: string | null) =>
     invoke<boolean | null>("push_github_moved", { root, branch, tracking }),
+  cliStatus: () => invoke<CliStatus>("cli_status"),
+  loginPathInfo: () => invoke<LoginPathInfo>("login_path_info"),
+  installCli: () => invoke<string>("install_cli"),
+  cleanupNow: () => invoke<{ archived: [string, string][]; inbox_deleted: number; errors: string[] }>("cleanup_now"),
   configInfo: () => invoke<{ path: string; home: string; text: string; effective: string }>("config_info"),
   saveConfig: (text: string) => invoke<void>("save_config", { text }),
   remoteInfo: () => invoke<RemoteInfo>("remote_info"),
@@ -166,7 +231,12 @@ export const api = {
   /** Read Jira and GitHub now (can take a while). */
   watchNow: () => invoke<WatchState>("watch_now"),
   startRetro: (tickets: string[], note = "") => invoke<Agent>("start_retro", { tickets, note }),
+  retroTickets: () => invoke<RetroTicket[]>("retro_tickets"),
+  setRetroHidden: (ticket: string, hidden: boolean) => invoke<void>("set_retro_hidden", { ticket, hidden }),
   retros: () => invoke<Retro[]>("retros"),
+  insightsModels: (from: number, to: number) => invoke<InsightsModels>("insights_models", { from, to }),
+  /** `bounds`: the starts of the weeks, and the end of the last. */
+  insights: (bounds: number[]) => invoke<Insights>("insights", { bounds }),
   /** Approve (and apply) or dismiss a proposal; returns what approving did. */
   decideProposal: (dir: string, id: string, approve: boolean) => invoke<string>("decide_proposal", { dir, id, approve }),
   /** A preview URL for a local file. `convertFileSrc` encodes the slashes
@@ -175,6 +245,12 @@ export const api = {
    *  protocol still reads as an absolute path. */
   fileSrc: (path: string) => convertFileSrc("") + path.split("/").map(encodeURIComponent).join("/").replace(/^\//, "%2F"),
 };
+
+/** "GitHub quota low, next check 11:09", or nothing when polling isn't held. */
+export function holdText(h: Hold | null | undefined): string {
+  if (!h || h.until * 1000 <= Date.now()) return "";
+  return `GitHub quota low, next check ${new Date(h.until * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
+}
 
 /** Ticket keys in `text`, uppercased and in order (the same rule drovr's record uses). */
 export function ticketsIn(text: string): string[] {

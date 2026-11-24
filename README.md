@@ -2,15 +2,15 @@
 
 <br>
 
-# drovr
+# drovr - Multi-Agent Control Plane for Claude Code, OpenCode & Codex
 
-A lightweight macOS desktop cockpit (Tauri + Svelte) for running Claude Code agents. Pull up a Jira ticket, hand it to one agent or to a group led by an orchestrator, and review what they do.
+A lightweight macOS desktop control plane (Rust, Tauri + Svelte) for orchestrating, monitoring and sharing context across Claude Code, OpenCode and OpenAI Codex agents. Pull up a Jira ticket, hand it to one agent or to a group led by an orchestrator, and review what they do.
 
 - **One inbox:** agents bring you their decisions, proposed commands and permission requests there.
 - **Agents coordinate:** they message each other directly when their work overlaps.
 - **Reports:** agents save HTML reports for you to review in `~/.claude/plans/`.
 - **Where agents run:** drovr runs them itself, or in [herdr](https://herdr.dev) panes next to your terminal.
-- **Which CLI runs them:** Claude Code, or OpenAI's Codex CLI (experimental). See [Harnesses](#harnesses-claude-code-and-codex).
+- **Which CLI runs them:** Claude Code, OpenCode, or OpenAI's Codex CLI (experimental). See [Harnesses](#harnesses-claude-code-opencode-and-codex).
 - **A ticket workflow (optional, off by default):** a record and timeline of each ticket's work, a watcher that follows your sprint and its PRs, stages with handoffs you approve, Jira and Confluence updates you review before they're posted, and a retro you start. One switch, `workflow.enabled`; see [The record](#the-record-timeline).
 
 **[USAGE.md](USAGE.md)** covers the commands and everyday workflows: keyboard shortcuts, recipes for each task, and the full CLI reference.
@@ -34,7 +34,7 @@ A lightweight macOS desktop cockpit (Tauri + Svelte) for running Claude Code age
 
 ## Status
 
-drovr is at version 0.11.3. <!-- x-release-please-version -->
+drovr is at version 0.17.1. <!-- x-release-please-version -->
 
 **Tested so far:**
 
@@ -49,6 +49,7 @@ drovr is at version 0.11.3. <!-- x-release-please-version -->
   - **A logging stand-in for herdr:** it confirms the exact `herdr` commands, and the parsing was checked against real `herdr agent get` output.
   - **The app in WebKit** (WebKitGTK with `tauri-driver` on a virtual display): the content security policy, the asset protocol's scope, the Inbox keys, the shortcut list and the long-diff view.
   - **The Codex CLI** (0.164.0, not logged in): drovr's `-c` overrides, its MCP server starting under Codex, and resuming a Codex session.
+  - **OpenCode** (2.3.0, not run): its `run` and TUI flags, `--format json` events, config keys, plugin API, tool names and session database were read from the 2.3.0 source, and the tests use those shapes. The permission plugin drovr writes was loaded under Node and Bun with a stand-in for OpenCode's plugin context: it asks `drovr hook permission` before each tool call, and refuses the call when drovr can't answer. drovr's side of the permission prompt (`permissions.auto_allow`, the permission mode and the Inbox) was run end to end. drovr needs OpenCode 2.
   - **The ticket workflow in WebKit**, with stand-ins for `claude`, `twg` and `gh`: the record and timeline, the watcher and Pipeline, rules and Jira drafts, stages and handoffs, the retro, and Confluence pages (the diff, the sandboxed preview, a page that changed before you approved it).
 - **twg's real output:** `jira workitem query` and `get` (with and without `-o json`) and `confluence content get --detail full`.
 - **twg's write commands against a real site:** posting a Jira comment and moving a ticket.
@@ -57,6 +58,7 @@ drovr is at version 0.11.3. <!-- x-release-please-version -->
 
 - Live herdr panes.
 - Codex agents with a logged-in Codex, doing real work.
+- OpenCode agents with a real `opencode` process: a run, its plugin loading, attaching, and an OpenCode agent in a live herdr pane.
 - Saving a Confluence draft with twg against a real site.
 
 ## Quick start
@@ -84,7 +86,7 @@ pnpm tauri dev
 
 The first build compiles the Rust side and takes a few minutes. After that, `pnpm tauri dev` starts in seconds.
 
-**Optional:** put the CLI on your PATH, for scripting and for herdr panes:
+**Optional:** put the CLI on your PATH, for scripting and for herdr panes. Choose **drovr → Install Command Line Tool…** (or Settings → Command line tool). It links `/usr/local/bin/drovr` to the CLI bundled in the app, so it updates with the app, and may ask for your password. If you build from source instead:
 
 ```sh
 cargo install --path crates/drovr-cli
@@ -103,14 +105,17 @@ cargo install --path crates/drovr-cli
 | Slack · Confluence | 5 | Search, read, send results to an agent, or ask a free-form question |
 | Message bus | 6 | Agents' messages to each other, and each group's shared notes, with a filter |
 | Code review | 7 | Changed files and diffs in each repo and worktree an agent worked in |
-| Settings | 8 | Theme, the phone page's sign-in link, and your config file |
-| Pipeline | 9 | Your sprint, its PRs and the agents on each ticket, and the retros (only with `workflow.enabled`) |
+| PRs | 8 | PRs waiting on your review, from offer to merge (once `[review]` watches a channel or team) |
+| Pipeline | 9 | Your sprint, its PRs and and the agents on each ticket (only with `workflow.enabled`) |
+| Insights | 0 | What runs cost, day by day, and by harness, model, stage and ticket; and how PRs turned out, by model; and the retros |
+
+Settings is ⌘/Ctrl+, (**drovr → Settings…**): theme, the phone page's sign-in link, and your config file.
 
 A ticket's **Timeline** opens over any view, from an agent's header, a group, or Pipeline.
 
 **Shortcuts** (⌘/Ctrl+/ lists them all in the app; [USAGE.md](USAGE.md#keyboard-shortcuts) has the table):
 
-- **Anywhere:** ⌘/Ctrl+1 … 9 switch views. ⌘/Ctrl+N starts a new agent and ⌘/Ctrl+G a new group. ⌘/Ctrl+F (Edit → Find…) finds text in the selected agent's output, or focuses the filter on the Message bus. ⌃` shows or hides the terminal. Esc closes a dialog.
+- **Anywhere:** ⌘/Ctrl+1 … 9 switch views and ⌘/Ctrl+, opens Settings. ⌘/Ctrl+N starts a new agent and ⌘/Ctrl+G a new group. ⌘/Ctrl+F (Edit → Find…) finds text in the selected agent's output, or focuses the filter on the Message bus. ⌃` shows or hides the terminal. Esc closes a dialog.
 - **In an agent's prompt box:** Enter sends and Shift+Enter adds a new line.
 - **In the Inbox:** ↓↑ or J K move, 1–9 pick an option, A allows or starts, D denies or declines (see [Inbox](#inbox)).
 - **In Settings:** ⌘/Ctrl+S saves.
@@ -131,13 +136,13 @@ Each agent has a state:
 
 In the agent list, click a group's name to collapse or expand it; a collapsed group still shows how many of its agents are working or blocked. ⊟ collapses every group at once. Your choices are remembered, and filtering shows matching agents even inside collapsed groups.
 
-The Agents view shows each agent's output as it runs: text, tool calls with their results, and the cost of each run. Costs are Claude Code's estimate at API list prices (`total_cost_usd`): what your plan actually charges may differ. Claude Code reports a running total for the whole conversation, so drovr counts only what each run added. The total next to an agent covers its headless runs; herdr agents' costs aren't tracked, and Codex reports tokens rather than a cost. An agent that has cost more than `defaults.cost_warning_usd` ($10 by default) is flagged in yellow in the list and its header.
+The Agents view shows each agent's output as it runs: text, tool calls with their results, and the cost of each run. Costs are Claude Code's estimate at API list prices (`total_cost_usd`): what your plan actually charges may differ. Claude Code reports a running total for the whole conversation, so drovr counts only what each run added. OpenCode reports what each step cost, and drovr adds up each run's. The total next to an agent covers its headless runs and its herdr runs; Codex reports tokens rather than a cost. An agent that has cost more than `defaults.cost_warning_usd` ($10 by default) is flagged in yellow in the list and its header.
 
 - **Prompt:** type in the box and send. If the agent is busy, your text is queued: it shows above the box, marked **Queued**, until the agent reads it, either when it checks its messages or when its run ends. Each queued message has two buttons:
   - **Send now** stops the current run and starts a new one with that message, plus anything else waiting for the agent before it. The agent is told its last run was cut short.
   - **✕** takes the message back and puts its text in the box to edit.
 - **Copy on select:** selecting text in the output copies it. Turn it off with `defaults.copy_on_select = false`.
-- **Stop, Resume, Remove:** Stop ends the current run (it shows while the agent is working). Resume continues the same conversation. **✕** removes the agent and its output in drovr once you click it and then **Remove?**, and dismisses anything of its still in the Inbox; its Claude Code session is kept. If drovr made it a worktree, the worktree is removed too when nothing in it is uncommitted, and kept (with a note saying so) when something is. Its `drovr/<name>` branch always stays, and an agent started later under the same name picks up that branch, or the worktree if it's still there.
+- **Stop, Resume, Remove:** Stop ends the current run (it shows while the agent is working). Resume continues the same conversation. **✕** removes the agent and its output in drovr once you click it and then **Remove?**, and dismisses anything of its still in the Inbox; its Claude Code session is kept. If drovr made it a worktree, the worktree is removed too when nothing in it is uncommitted, and kept (with a note saying so) when something is. Its `drovr/<name>` branch always stays, and an agent started later under the same name picks up that branch, or the worktree if it's still there. A PR reviewer's worktree and branch are the exception: they're deleted with it, even with uncommitted files (see [Review PRs from Slack and GitHub](#review-prs-from-slack-and-github)).
 - **Open in herdr:** opens the agent's session interactively in a new herdr pane. If the agent is already running in a herdr pane, it focuses that pane instead. Without herdr, **Copy attach cmd** copies a `cd … && claude --resume …` command for any terminal.
 - **Terminal:** a terminal under the output. See below.
 
@@ -164,8 +169,8 @@ The Agents view shows each agent's output as it runs: text, tool calls with thei
 - **Task:** the agent's first prompt. Type it, or pick a `.md` or `.txt` file under **Prompt from file** to load it into the box, where you can still edit it.
 - **Jira ticket:** the ticket the agent's work tracks. Or check **Create a Jira ticket for this**, with optional notes ("a bug, assigned to me, in the current sprint"): the agent first writes a ticket for its task, following `jira.ticket_skill` if set, and creates it. Its create command comes to the Inbox for you to allow like any other. It then calls `set_ticket`, and the new key becomes its ticket (and its group's, when it leads a group without one).
 - **Group:** putting the agent in a group means it coordinates with the group's other agents. Its prompt files and reports then come from the group's plans folder.
-- **Run with:** Claude Code, or Codex (experimental, when `codex` is installed). See [Harnesses](#harnesses-claude-code-and-codex).
-- **Model:** the model this agent runs on, e.g. `claude-opus-5-5`. Empty uses the default (`defaults.model`, or `codex.model` for Codex), shown as the placeholder. **New group** with a lead and **Dispatch** have the same box, as **Lead's model** when they start a group: it sets the lead's model. Workers that start without asking run on it too; workers you approve in the Inbox and stage agents get their own defaults, which you can change there.
+- **Run with:** Claude Code, OpenCode (when `opencode` is installed), or Codex (experimental, when `codex` is installed). See [Harnesses](#harnesses-claude-code-opencode-and-codex).
+- **Model:** the model this agent runs on, e.g. `claude-opus-5-5`. Empty uses the default (`defaults.model`, `opencode.model` for OpenCode, or `codex.model` for Codex), shown as the placeholder. OpenCode models are `provider/model`, e.g. `anthropic/claude-sonnet-5-5`. **New group** with a lead and **Dispatch** have the same box, as **Lead's model** when they start a group: it sets the lead's model. Workers that start without asking run on it too; workers you approve in the Inbox and stage agents get their own defaults, which you can change there.
 - **Closing the dialog:** once you've typed a task, Esc or a click outside asks first: do it again within a few seconds to discard the typing. **Cancel** and **✕** close it straight away.
 
 ### Starting from an existing Claude Code session
@@ -261,14 +266,14 @@ To publish a report, or any local HTML file, as a claude.ai artifact:
 
 drovr keeps a record of everything that happens on a ticket, so you can look back at how the work went and, later, run a retro on it.
 
-**It's off by default, as one switch:** `workflow.enabled = true` (in `[workflow]`) turns on the whole ticket workflow together: the record and timeline, agents' `record_decision` and `draft_jira_update` tools, the watcher and Pipeline (⌘9), stages in groups created from then on, and the retro. Set it back to `false` and drovr works exactly as before: nothing more is recorded or polled, agents get the old tools from their next run, and the timeline buttons and Pipeline go away. Records already written stay on disk. The switch takes effect when you save it in Settings; agents pick it up on their next run.
+**It's off by default, as one switch:** `workflow.enabled = true` (in `[workflow]`) turns on the whole ticket workflow together: the record and timeline, agents' `record_decision` and `draft_jira_update` tools, the watcher and Pipeline (⌘9), stages in groups created from then on, and the retro. Set it back to `false` and drovr works as before: nothing more is recorded on tickets or polled (what runs cost still is; see [The spend log](#the-spend-log)), agents get the old tools from their next run, and the timeline buttons and Pipeline go away. Records already written stay on disk. The switch takes effect when you save it in Settings; agents pick it up on their next run.
 
 The record is plain files: `ledger.jsonl` in the ticket's own folder, one JSON event per line, only ever appended to. The folder is in the group's plans folder (`~/.claude/plans/<group>/<TICKET>/`), or in the plans folder itself for a solo agent's ticket (`~/.claude/plans/<TICKET>/`). You can read the file in any editor, keep it in git, or hand it to an agent.
 
-- **Which agents:** an agent's events go to its own tickets (its **Ticket** field, e.g. `SRE-3230, SRE-3253`), or to its group's ticket when it has none. An agent with no ticket has no record.
+- **Which agents:** an agent's events go to its own tickets (its **Ticket** field, e.g. `SRE-3230, SRE-3253`), or to its group's ticket when it has none. An agent with no ticket has no record. Once a ticket's agents and group are gone, retros and what the watcher sees still go to its existing record (the one written to last).
 - **What's recorded:**
   - **Agents:** agents starting and being removed.
-  - **Runs:** each run's start (its prompt, the configured model, a new or resumed session) and its end (how it ended, cost, duration, turns, tokens in and out and from the cache, and the models it used).
+  - **Runs:** each run's start (its prompt, the configured model, a new or resumed session) and its end (how it ended, cost, duration, turns, tokens in and out and from the cache, the models it used, and what each cost when the CLI says).
   - **The Inbox:** each item as it's asked (questions, commands, permissions, worker requests, done reports) and how it was resolved (answered, declined or dismissed, and how long it waited).
   - **Agent decisions:** what agents decided themselves, with `record_decision`.
   - **Messages:** messages between agents and from you.
@@ -281,6 +286,35 @@ The record is plain files: `ledger.jsonl` in the ticket's own folder, one JSON e
 - **Secrets stay out:** anything that looks like a credential (GitHub, GitLab and Slack tokens, Anthropic and AWS keys, bearer tokens) is replaced with `[redacted]` before it's written.
 - **Timeline:** **Timeline** in an agent's header, or **timeline** on a group, shows the record. It has a day-by-day list you can filter (runs, decisions and the Inbox, messages and prompts, status and reports, agents and wakes, Jira and PRs, stages, retro) with totals at the top: runs and cost, questions asked and declined, decisions, wakes. Click an event to see all of it. **Show folder** opens the ticket's folder in Finder, and **Start retro** starts a retro on the ticket.
 - **Nothing else changes:** writing the record never stops the work. If a write fails, drovr logs it and carries on.
+
+### The spend log
+
+drovr records what each run cost, in its database (`drovr.db` in its state folder, `~/.local/share/drovr`), **whether or not `workflow.enabled` is on**. A row per run and model holds the time, the agent with its role, group, tickets and stage, the harness, the model, the cost, the token counts, how long it took and how it ended. It never holds a prompt, a message or a task, and it stays on your Mac.
+
+- **Costs are what the CLI reports.** When it reports none (Codex, or a run that was killed), the cost is unknown, not zero.
+- **Models go by one name,** however the run was started (`opus`, or a gateway's path in OpenCode); the name it was started with is kept too.
+- **Earlier runs** are added once, from the tickets' records, the first time the app runs with the log. Records don't say whether a zero cost was reported, so those count as unknown.
+
+### Insights
+
+**Insights** (⌘0) adds up the spend log, whether or not the workflow is on:
+
+- **Totals:** what you spent, an average full week and day (weekends too), and an average retro (its agent's runs). Set `weekly_target_usd` under `[insights]` to show a target beside the week.
+- **Spend by day:** stacked by harness, for the last 2, 4, 8, 12 or 26 weeks, which start on Mondays. A ◆ marks each day a retro was started. **Show table** gives the same numbers as a table.
+- **By harness, model, stage and ticket:** each adds up to the total. A model run through OpenCode is marked `(OC)`, apart from the same model in Claude Code. A run on several tickets is split evenly between them.
+
+Runs whose CLI reported no cost are counted separately, and the totals leave them out. A retro with no cost in the spend log, such as one from before the log, isn't in the average retro.
+
+With the workflow on, the watcher also keeps what became of each PR it follows (`watch.github_repos`): when it was ready, merged or closed, pushes and failed CI once it was ready, how many of its heads others reviewed, and its size. The Overview shows the cost per merged PR (everything spent, divided by the PRs merged), the share reworked, and the median time from ready to merged.
+
+**Models** compares what merged PRs cost by the model that built them, rework included:
+
+- **Rework:** a PR took rework if, once it was ready for review, it was pushed to again, its CI failed or changes were requested, or if you sent its build handoff back while it was open. The builder's and its reviewer's runs that start after it was ready (or sent back) are the rework, and count against the model that built it, whichever model ran them.
+- **Like with like:** PRs are grouped by size (added and deleted lines: up to 100, up to 500, over 500), by model, and by whether the builder had a reviewer. A group with fewer than 10 PRs says it's too small to compare.
+- **Who built it:** the agent whose `drovr/<agent>` branch it is, else the one build agent with a worktree of that repo on the PR's branch, else its tickets' only build agent. It's never guessed. A builder's runs are shared evenly by its PRs that are still open, so costs of PRs built together are estimates.
+- **Left out, and counted:** PRs not seen from the start (first seen over an hour after they were opened, or already merged), with no one certain builder, with no runs logged, or built by several models, a router or an alias whose version isn't known.
+
+Earlier PRs are added once, from the tickets' records. Those don't say how big a PR was or how often it was reviewed.
 
 ### Stages
 
@@ -303,13 +337,17 @@ Part of the ticket workflow (`workflow.enabled`). A ticket goes through stages, 
   2. It continues the agent in a fresh session that starts from that checkpoint, the handoffs, the decisions so far and the PR's status.
 
   A long build doesn't carry its whole history, and you're not paying to re-read it.
+- **Reviews alongside the build:** with `stages.review` on, drovr starts a reviewer with every build agent, `<builder>-review`. It isn't a stage in `stages.order`: it runs at the same time as its builder, in the builder's folder, on `stages.models.review`, with the same harness, and doesn't count toward `orchestrator.max_workers`.
+  - The builder sends it each piece that works. The reviewer reviews it, following `stages.review_skill` when that's set, and replies with findings and proposed diffs. The builder applies them or says why not, and gets a final review of the whole change before it hands off.
+  - The reviewer can't change files. Claude Code runs it with `--disallowedTools Edit,Write,MultiEdit,NotebookEdit`. OpenCode gets a `deny` rule for edits in the agent's config, which holds in herdr panes too, and drovr's plugin refuses edits. Codex runs it in the `read-only` sandbox. On Claude Code and OpenCode the shell can still write files: the reviewer is told not to.
+  - It never hands off. It stops when its builder does: its handoff approved, you or the lead stopping it, or its removal.
 - **In the app:** stage agents show their stage in the agent list and Pipeline, and the timeline has a **Stages** filter.
 
 ### The retro
 
-Part of the ticket workflow (`workflow.enabled`), and it runs only when you start one: **Start retro** in a ticket's timeline, or **Retro…** in Pipeline to pick several tickets. The picker shows when each ticket's last retro ran, and hides tickets with nothing new since their retro behind a toggle. Add a note if there's something to look at in particular.
+Part of the ticket workflow (`workflow.enabled`), and it runs only when you start one: **Start retro** in a ticket's timeline, or **Retro…** under **Retros** in Insights (⌘0) to pick several tickets. The picker has four lists: **Not covered** (no retro has read them), **New work** (agents, PRs or reviews moved since the last retro; Jira changes and cleanup don't count), **Covered**, and **Hidden**. The first two start out picked, and a retro on a ticket with new work starts from where the last one stopped. **Hide** takes a ticket out of its list, and **Show** puts it back. With `retro.hide_decided`, a covered ticket is hidden once you've decided every proposal of its retros. A hidden ticket comes back when there's new work on it, and its record is kept. Add a note if there's something to look at in particular.
 
-1. **The numbers:** drovr works them out from the tickets' records itself and saves them as `evidence.json` in the retro's folder (`~/.claude/plans/retros/<when>/`). They cover runs, cost and tokens by stage and model, rework (handoffs sent back, CI failures, changes requested), dismissals (Inbox items declined or dismissed), misses (PRs closed unmerged), overrides (a stage's model changed at a handoff), wakes, checkpoints, how long the Inbox waited on you, and your stops and **Send now**s.
+1. **The numbers:** drovr works them out from the tickets' records itself and saves them as `evidence.json` in the retro's folder (`~/.claude/plans/retros/<when>/`). They cover runs, cost and tokens by stage, harness and model (a model has one name however it was started: `opus`, `claude-opus-5-5` or a gateway's `…/anthropic/claude-opus-5.5`), rework (handoffs sent back, CI failures, changes requested), dismissals (Inbox items declined or dismissed), misses (PRs closed unmerged), overrides (a stage's model changed at a handoff), wakes, checkpoints, how long the Inbox waited on you, and your stops and **Send now**s.
 2. **The retro agent** (on `retro.model`) reads the records, the handoffs and those numbers. It gets your current stages, models, limits, rules and skills, and the last 50 proposals from earlier retros with what you decided, so it doesn't bring back one you dismissed without new evidence. It submits proposals, each with its evidence:
    - **model:** a stage's model (`stages.models.<stage>`): cheaper where rework stays low, stronger where rework costs more than it saves.
    - **threshold:** the build checkpoint limits.
@@ -318,7 +356,7 @@ Part of the ticket workflow (`workflow.enabled`), and it runs only when you star
    - **skill_edit / new_skill:** a whole `SKILL.md`.
 
    It also publishes a short report to Reports.
-3. **You decide:** proposals appear under **Retros** at the top of Pipeline. **Approve** one at a time, or **Approve all**, or **Dismiss**. Approving applies it:
+3. **You decide:** proposals appear under **Retros** in Insights. **Approve** one at a time, or **Approve all**, or **Dismiss**. Approving applies it:
    - **Config changes:** written to your `config.toml` with its comments and layout kept. The file before the change is saved beside it as `config.toml.before-retro`. drovr only changes the keys above.
    - **Skills:** written to `retro.skills_dir/<name>/SKILL.md` (`~/.claude/skills`), with the one it replaces kept beside it.
    - **The record:** every approval and dismissal goes into the tickets' records and the retro's `decisions.jsonl`. Every later retro is told about them, whichever tickets it's on.
@@ -333,8 +371,9 @@ drovr's watcher keeps it current without an agent, so it spends no tokens:
 
 - **Jira:** every `watch.jira_poll_secs` (5 minutes) it runs the `watch.jql` query (by default your open sprint) through the Jira `command` provider (twg) or `rest`. It reads a ticket in full, with its comments, only when its `updated` time moved.
 - **Pull requests:** every `watch.pr_poll_secs` (2 minutes, or 1 while checks run) it searches `watch.github_repos` with `gh` for PRs whose title has one of those ticket keys (`owner/repo`, or `owner/*` for all of an owner's repos), and looks closer at PRs that changed or whose checks are still running.
-- **Into the record:** status moves, new comments, tickets joining or leaving the sprint, PRs linked, CI passing or failing, reviews, conflicts, merges and closes go to each ticket's record (for tickets an agent or group is on). The first read only takes a baseline. After that, an open PR the watcher hasn't seen before (a new one, or one whose ticket just came into view) counts as changed from nothing: reviews, failing checks or a conflict already on it, draft or not, go through `watch.rules` once.
+- **Into the record:** status moves, new comments, tickets joining or leaving the sprint, PRs linked, CI passing or failing, reviews, conflicts, merges and closes go to each ticket's record (for tickets an agent or group is on, or that already have a record). The first read only takes a baseline. After that, an open PR the watcher hasn't seen before (a new one, or one whose ticket just came into view) counts as changed from nothing: reviews, failing checks, a conflict, or being green and waiting on review already on it, draft or not, go through `watch.rules` once.
 - **While the app is closed** nothing is read. drovr keeps what it last saw in `watch.json` in its data folder, so the first read after you open the app records what changed meanwhile.
+- **GitHub's quota:** before each GitHub poll, drovr reads your API quota with `gh api rate_limit`, which doesn't count against it. Below 25% of the GraphQL quota it polls 4 times less often; below 5% of the GraphQL or search quota it waits for the reset. The header then shows "GitHub quota low, next check 11:09". **Refresh now** still reads GitHub unless a quota is empty. Jira keeps its own timing. The REST quota isn't counted, since these polls don't use it. PR review polling works the same way.
 - **Refresh now** reads both at once. Errors (a missing `gh`, `twg` needing `twg login`, a search command whose JSON has no issue keys) show at the top. The search command can print a list of issues, Jira's `{"issues": […]}`, or either inside twg's `-o json` envelope (`"data"`).
 
 With twg, set the Jira provider to it:
@@ -358,15 +397,17 @@ For each change, `watch.rules` says whether to **wake** the agent that owns the 
 | Rule | When | Default | What the agent gets |
 | --- | --- | --- | --- |
 | `ci_failed` | A PR's checks have all finished and some failed | wake | The failing checks and the end of the failing GitHub Actions log (`gh run view --log-failed`, last 150 lines) |
-| `changes_requested` | A reviewer requested changes | wake | The latest reviews and inline review comments (file:line) |
-| `new_review` | A new review without a change request | wake | The same |
+| `ci_passed` | Its checks went from pending or failing to passing | wake | CI passed and a nudge to carry on |
+| `changes_requested` | A reviewer requested changes | wake | Each reviewer's latest review and every unresolved review thread (file:line) |
+| `new_review` | Each new review without a change request (fires for every review, not once per commit) | wake | The same |
+| `ready_for_review` | Green, mergeable, no review decision yet; once per commit | ask | A "waiting on review" item for you |
 | `conflict` | The PR has merge conflicts | wake | What to do: merge the base in, resolve, push |
 | `approved_green` | Approved, checks green, no conflicts | ask | A "ready to merge" item for you |
 | `merged` | The PR merged | ask | An item for you, plus Jira drafts (below). Sent on, the agent is asked to wrap up: what's left, and what you should know |
 | `pr_closed` | Closed without merging | ask | An item for you |
 | `jira_changed` | The ticket's status, assignee or comments changed, or it left the sprint | ask | An item for you |
 
-- **Once per head:** a rule fires once per PR head commit, so a failure that stays failed doesn't wake the agent again until it pushes.
+- **Once per head:** a rule fires once per PR head commit (`new_review` once per review), so a failure that stays failed doesn't wake the agent again until it pushes.
 - **Busy agents:** if the agent is working, the wake waits as a queued message (with **Send now**).
 - **Asked instead:** a stopped agent, or a ticket nobody's on, is asked about instead of woken.
 - **Watcher items:** in the Inbox they say what changed, with the details, and what **Send to <agent>** would ask the agent to do. Sending passes all of it on.
@@ -462,7 +503,7 @@ Set `memory.dir` to a memory folder, and every Claude Code agent uses that one i
 - **Who writes it:** leads and solo agents, retro agents included. Workers read it but don't write it: drovr denies their Write and Edit there. When a worker learns something worth keeping, it sends it to its lead with `send_message`, starting with "For memory:", and the lead decides what to save.
 - **Two leads at once** can still write it at the same time. They're told to read a file just before changing it and to edit rather than rewrite, and Claude Code refuses an edit to a file that changed since it was read.
 - **Keep the index short:** Claude Code loads only the first 200 lines (or 25 KB) of `MEMORY.md`, and with every agent saving into one, it fills up faster.
-- **Codex agents** have no auto memory, so this doesn't change them.
+- **Codex and OpenCode agents** have no auto memory, so this doesn't change them.
 
 ### Code review
 
@@ -473,12 +514,26 @@ For any agent, this lists every git repo and worktree it worked in, so it works 
   - the folders it `cd`'d into or ran `git -C` on;
   - the worktrees it added with `git worktree add`.
 
-  A Codex agent's run logs are read the same way: the commands it ran and the files it changed. The most recently touched repo comes first. Repos with no changes start collapsed.
+  A Codex or OpenCode agent's run logs are read the same way: the commands it ran (and the `workdir` OpenCode ran them in) and the files it changed. The most recently touched repo comes first. Repos with no changes start collapsed.
 - **What counts as a change:** everything on the branch since it left the default branch (`origin/HEAD`, else `origin/main`, `origin/master`, `main` or `master`), plus uncommitted and untracked files. Committed and pushed work still shows up. A green status letter is committed on the branch; a yellow one isn't committed yet.
 - **Each repo** shows its branch, how many commits it's ahead, and its last commit, then the changed files with colored diffs and its HTML pages.
 - **The plans folder's repo:** if the plans folder is in a git repo (often `~/.claude` itself), every agent's work is in it. There an agent's review shows only the folders it started in and the files it touched ("Only plans/release"), not the whole repo.
 
 **Send feedback** prompts the agent with your comments about a file, naming the repo. Long diffs (a lockfile, generated code) stay fast: only the lines in view are drawn. An untracked file over 1 MiB isn't shown, and a longer one stops at 2000 lines with a note.
+
+### Review PRs from Slack and GitHub
+
+drovr can watch Slack channels for GitHub PR links and your GitHub teams for review requests, and list each PR in **PRs** (⌘8), from when it's found until it merges or closes. Set `review.slack_channels` (such as `"#sre-reviews"`) and `review.github_teams` (`"org/team"`), and drovr looks every `review.poll_secs` while the app runs. New PRs wait under **New**, where **Dispatch reviewer** starts a reviewer and **Dismiss** hides the PR; with `review.auto_dispatch` it starts without asking. A reviewed PR moves under **Reviewing**, with **Open reviewer**, **Report** and **Dismiss**, which removes the reviewer. Each row shows CI, GitHub's review decision and your own latest review, refreshed on every poll (**Refresh** polls now). New PRs raise a notification while drovr is in the background, show as a count on the PRs item, and add to the Dock badge; they don't go to the Inbox. The phone page doesn't show PRs yet.
+
+- **Where it works:** each reviewer gets its own folder, `<home>/worktrees/<name>`, and the PR's head is checked out in `./pr` inside it. The reviewer runs in the folder, not in `pr`, so the PR's own agent config (`.claude/settings.json` hooks, `.mcp.json`, `opencode.json`, `.opencode/`, Codex config) is never loaded: the PR's own agent config can't run code when the reviewer starts. It reads the PR with `git -C pr …` and `gh pr diff`. The clone is `<review.repos_dir>/<repo>` (`defaults.cwd` when `repos_dir` is empty), and drovr clones it with `gh` if it's missing. It fetches from whichever remote points at the PR's repo, so a clone with `origin` as your fork and `upstream` as the base works. If no remote matches, the reviewer fails with an error that says so.
+- **Read-only:** the reviewer doesn't change anything on GitHub until you tell it to post. That's enforced by its instructions, so to make it a hard stop, keep `gh pr review` and `gh pr comment` out of `permissions.auto_allow`. It doesn't run the PR's code, scripts or tests unless you ask.
+- **Skill and model:** reviewers follow `stages.review_skill` (empty, they do a thorough review on their own) and run on `stages.models.review`, with the harness in `defaults.harness`.
+- **Only some owners:** set `review.owners = ["my-org"]` to offer and dispatch only PRs in those GitHub orgs or users (case-insensitive); empty is any. `drovr review <url>` refuses other owners too.
+- **What it produces:** a report titled "Review owner/repo#n" and a message with a summary. It stays running, so you can talk to it.
+- **Removing it** deletes its worktree and its branch, even with uncommitted files. With `review.remove_when_closed`, a reviewer that isn't working is removed once its PR merges or closes, including ones you started with `drovr review <url>`, as long as `review.poll_secs` isn't 0.
+- **What's skipped:** closed PRs and your own. While drovr can't tell your GitHub login it offers nothing, and tries again on the next poll. Your own PRs already under **New** are removed when they're refreshed. A draft requested from your team is offered once it's ready; one linked in Slack is skipped. Each PR is offered once. A PR you dismissed comes back if someone posts it in a watched channel after you dismissed it. The first poll looks back one day, and never more than 7.
+- **GitHub's quota:** polls, including the Slack read, slow down and pause as your GitHub API quota runs low, as in [Pipeline](#pipeline-the-watcher). **Refresh** and `drovr review poll` still run unless a quota is empty.
+- **Slack** is read through the configured [Slack provider](#jira-confluence-and-slack-lookups). With `provider = "agent"`, each poll is a short `claude -p` run, so it costs a little each time.
 
 ### Phone access
 
@@ -523,7 +578,9 @@ tls_key = "~/certs/example.com/privkey.pem"
 
 ### Themes
 
-Match System, Light, Dark, Darcula, Solarized Dark and Nord: the same set and colors as local-wiki. Choose one from **View → Theme** or in Settings. Your choice is saved, and Match System follows macOS light/dark.
+Match System, Light, Dark, Darcula, Solarized Dark, Nord, Gilded, Deco Navy, Oxblood and Ink & Gold. The first five are the same set and colors as local-wiki. Gilded, Deco Navy, Oxblood and Ink & Gold add gold lettering on the sidebar wordmark, agent titles, lead agents in the list and run labels, and show drovr's messages and agents' tool calls in gold. Choose one from **View → Theme** or in Settings. Your choice is saved, and Match System follows macOS light/dark.
+
+Themes are defined once, in `app/src/lib/themes.json`. Each has an `id`, a `name`, a `scheme` (`light` or `dark`) and its 17 `colors`, and may have `lettering` with a `color` and a `foil` gradient. Four of the colors, `chart-1` to `chart-4`, are for charts, in that order; tests fail if a theme lacks them, if one is hard to see on the background or the panel, or if neighbors look too alike, including with red-green color blindness. The UI and View → Theme both read that file.
 
 ## How it works
 
@@ -550,9 +607,11 @@ Match System, Light, Dark, Darcula, Solarized Dark and Nord: the same set and co
   - **Permissions:** prompts go to the Inbox through `--permission-prompt-tool mcp__drovr__approve`.
   - **No claude.ai artifacts:** `claude -p` doesn't have Claude Code's artifact tools. See [Sharing a report as a claude.ai artifact](#sharing-a-report-as-a-claudeai-artifact).
 - **herdr agents** (`backend = "herdr"`):
-  - **Runs:** an interactive Claude Code session in its own herdr tab, started with `herdr agent start <name> --kind claude --pane <id> -- <claude args>` and driven with `herdr agent prompt` and `herdr agent read`.
+  - **Runs:** an interactive Claude Code or OpenCode session in its own herdr tab, started with `herdr agent start <name> --kind claude --pane <id> -- <claude args>` (`--kind opencode` and OpenCode's TUI arguments for OpenCode) and driven with `herdr agent prompt` and `herdr agent read`.
+  - **OpenCode in herdr:** before starting it, drovr exports `OPENCODE_CONFIG` in the pane's shell, pointing at the agent's `opencode.json` (drovr's MCP server, system prompt, `opencode.model` and `opencode.agent`, and no permission plugin), and starts the TUI with `--standalone` so it reads that config rather than joining OpenCode's background service. OpenCode names its session itself: drovr takes it from `herdr agent get` (`agent_session`) when herdr's OpenCode integration is installed (`herdr integration install opencode`, which also makes its working, idle and blocked states exact), and otherwise, when a run ends, from OpenCode's database: the newest session started in the agent's folder since its pane opened. Its cost, context and model come from OpenCode's database too, so the cost, run records and the build stage's checkpoint work as for Claude Code. OpenCode's TUI can't fork a session, so a fork runs headless.
   - **Costs and run records:** Claude Code only reports an interactive session's cost to its status line, so a herdr agent's status line is `drovr status-line <agent>`, which saves the figures and shows the agent's name. It replaces your own `statusLine` in that session only. drovr adds up the cost and records each run when herdr says the agent went from working to idle, so the app, retros and the build stage's checkpoint all see it. These sessions don't report tokens per run or turns, so retros show those as 0.
   - **State:** comes from `herdr agent get` (`.result.agent.agent_status`).
+  - **Output:** the Agents view shows a herdr agent's session the way it shows a headless one: your prompts, its text, tool calls with their results, and for OpenCode each turn's cost. drovr reads the CLI's own record of the session: Claude Code's transcript in `~/.claude/projects`, or OpenCode's database, read-only, at the path `opencode debug paths db` prints. A prompt sent through a file shows the file's text. While the agent waits for you in its pane (herdr says `blocked`), the last line says so, with a button to the pane. **Pane** in the agent's header shows the pane's screen instead (`herdr agent read`), as does an agent whose session drovr doesn't know yet.
   - **Permissions:** you approve them in the pane, as usual.
   - **Long prompts:** macOS rejects typed terminal lines over about 1 KB, so long prompts (a whole Jira ticket, say) and long commands are written to a file, and the pane gets a short line pointing at it.
 - **Choosing a backend:** you pick headless or herdr each time you start an agent or group; `defaults.backend` sets the preselected choice.
@@ -562,11 +621,18 @@ Match System, Light, Dark, Darcula, Solarized Dark and Nord: the same set and co
   - **After a reboot:** headless runs are gone and show as **interrupted**. Resume them with one click, or set `defaults.auto_resume`. drovr also checks that a run's process ID still belongs to that run, because process IDs are reused after a reboot.
 - **Cost guard:** auto-wake pauses after 15 runs in 10 minutes for one agent, so two agents messaging each other can't loop on your API bill. Prompt the agent yourself to carry on.
 
-### Harnesses: Claude Code and Codex
+### Harnesses: Claude Code, OpenCode and Codex
 
-The CLI that runs an agent is its harness. Everything that depends on one CLI is behind the `Harness` trait in `crates/drovr-core/src/harness/`: building its commands (headless, herdr, attach), reading a line of its run log, reading a run's cost, and finding its saved sessions. `claude.rs` and `codex.rs` implement it. The database, the coordination MCP server, the Inbox, reports and the UI work the same with either, and supporting another CLI means one more implementation.
+The CLI that runs an agent is its harness. Everything that depends on one CLI is behind the `Harness` trait in `crates/drovr-core/src/harness/`: building its commands (headless, herdr, attach) and their environment, reading a line of its run log (with what it kept from the run's earlier lines), reading a run's cost, and finding its saved sessions. `claude.rs`, `opencode.rs` and `codex.rs` implement it. The database, the coordination MCP server, the Inbox, reports and the UI work the same with any of them, and supporting another CLI means one more implementation.
 
 - **Claude Code** (`claude`, the default): everything above, including the permission prompt, costs, herdr panes, and starting from an existing session.
+- **OpenCode** (`opencode`): choose **Run with → OpenCode** when starting an agent, group or hand-off, pass `--harness opencode` to the CLI, or set `defaults.harness = "opencode"`. An orchestrator's workers use its harness.
+  - **Runs:** each prompt is a detached `opencode run --standalone --format json` run, and later ones `opencode run --session <session>`. drovr writes an OpenCode config for the agent, `opencode-run.json` in its folder under `agents/`, and points `OPENCODE_CONFIG` at it: drovr's MCP server (as `drovr`, with a one-hour timeout, since its tools can wait for you) and the system prompt as an `instructions` file. OpenCode merges it over your own config, so your `opencode.json`, providers, plugins and MCP servers still apply. `--standalone` gives the run a server of its own: OpenCode 2's background service was started before drovr's config existed, so a run that joined it wouldn't read the config.
+  - **Permissions:** OpenCode's `run` rejects every permission prompt it can't show, so drovr answers them itself. The config loads a small plugin drovr writes next to it, the folder `opencode-plugin` (`server.js`, in OpenCode 2's plugin API); before each tool call it asks `drovr hook permission`, which answers as Claude Code's permission prompt is answered: OpenCode's tools are named as Claude Code's (`shell` is `Bash`, `edit`, `write` and `patch` are `Edit`/`Write`, `subagent` is `Task`, `drovr_send_message` is `mcp__drovr__send_message`, and another MCP server's `<server>_<tool>` is `mcp__<server>__<tool>`, split at the server's name, which the plugin asks OpenCode for, so a server named `my_docs` works; OpenCode's own tools, like `worktree_create`, keep their names), so `permissions.auto_allow`, `defaults.disallowed_tools` and `defaults.permission_mode` (`acceptEdits` allows edits inside the working directory and the plans folder, `reports.dir`, where agents keep their plans and reports; so does `auto`, since drovr has no judge like Claude Code's to decide the rest; `plan` refuses edits, `bypassPermissions` allows everything) apply as they are, and the rest comes to your Inbox. OpenCode's code mode (`execute`) isn't asked about itself: each tool its code calls is. A denial reaches the model as the tool's error, and so does a check that fails (drovr can't be started, say), so a broken check never lets a call through. The run passes `--auto`, so OpenCode's own prompts don't reject what drovr allowed; `deny` rules in your OpenCode config still hold.
+  - **Costs:** OpenCode reports each step's cost and tokens; a run's last line shows what the run cost, and the build stage's checkpoint reads the session's total.
+  - **Sessions:** **Existing session** in **New agent** lists OpenCode's sessions when **Run with** is OpenCode (pasting a `ses_…` ID picks OpenCode for you), and `drovr adopt` takes them too. drovr reads OpenCode's database for them, read-only, where `opencode debug paths db` says it is. Fork continues in a copy (`--fork`), headless only. **Copy attach cmd** opens the session in OpenCode's TUI (`opencode --standalone --session <id>`) with drovr's MCP server and system prompt (from `opencode.json` in the agent's folder), where you answer its permission prompts yourself.
+  - **Other settings:** `opencode.model` (`provider/model`, as `opencode models` lists it), `opencode.agent` (the OpenCode agent to run as) and `opencode.extra_args` (added to headless runs; the TUI takes the model and agent from its config). `defaults.max_budget_usd` is Claude Code's flag, so it doesn't cap OpenCode runs.
+  - **herdr panes:** choose **Run in → herdr pane**, as for Claude Code. You answer OpenCode's permission prompts in the pane. **herdr agents** under [How it works](#how-it-works) says how drovr follows its session and cost.
 - **Codex** (`codex`, experimental): choose **Run with → Codex** when starting an agent, group or hand-off, pass `--harness codex` to the CLI, or set `defaults.harness = "codex"`. An orchestrator's workers use its harness.
   - **Runs:** each prompt is a detached `codex exec --json` run, and later ones `codex exec … resume <session>`. drovr's MCP server and system prompt are passed with `-c` overrides, so your `~/.codex/config.toml` and its MCP servers still apply.
   - **Permissions:** Codex has no permission prompt drovr can answer, so it runs in its own sandbox (`codex.sandbox`, `workspace-write` by default) with approvals off. Anything outside the sandbox comes to your Inbox as a command, through `propose_command`.
@@ -608,7 +674,7 @@ Agents read text other people write (tickets, pages, Slack messages), and that t
 | `report_done` | Mark the task finished, with a summary |
 | `record_decision` | Record a decision the agent made itself (question, options, choice, why) in the ticket's record. Only with `workflow.enabled` |
 | `draft_jira_update` | Draft a Jira comment or status move for you to edit and post. Only with `workflow.enabled` |
-| `approve` | The permission prompt used by headless runs |
+| `approve` | The permission prompt used by headless runs (OpenCode's plugin reaches the same check through `drovr hook permission`) |
 
 ## Configuration
 
@@ -617,19 +683,21 @@ drovr reads `~/.config/drovr/config.toml`. Every key is optional, and [`config.e
 | Key | Default | What it does |
 | --- | --- | --- |
 | `defaults.backend` | `"headless"` | Preselected backend for new agents: `headless` or `herdr` |
-| `defaults.harness` | `"claude"` | Preselected CLI for new agents: `claude` or `codex` (experimental) |
+| `defaults.harness` | `"claude"` | Preselected CLI for new agents: `claude`, `opencode` or `codex` (experimental) |
 | `defaults.cost_warning_usd` | `10` | Flag an agent in the app once its runs have cost more than this; `0` turns it off |
 | `defaults.copy_on_select` | `true` | Selecting text in an agent's output copies it (`terminal.copy_on_select` covers the terminal) |
 | `defaults.cwd` | home folder | Where new agents start when you don't give a directory |
 | `defaults.model` | your Claude Code default | Model for agents |
-| `defaults.permission_mode` | `"acceptEdits"` | Claude Code permission mode for agents |
+| `defaults.permission_mode` | `"acceptEdits"` | Claude Code permission mode for agents; OpenCode agents follow it too |
 | `defaults.worktrees` | `false` | Give each agent its own `git worktree` on a `drovr/<name>` branch. Only when the working directory is a git repo; an agent started above your repos makes its own. A retro's agent always works in its retro's folder. |
 | `defaults.auto_wake` | `true` | Re-prompt idle agents when a message or answer arrives |
-| `defaults.max_budget_usd` | `0` (no cap) | Cost cap for each headless run |
+| `defaults.max_budget_usd` | `0` (no cap) | Cost cap for each headless Claude Code run |
 | `defaults.auto_resume` | `false` | Resume headless runs a reboot or crash interrupted, as soon as drovr notices, instead of waiting for you |
 | `defaults.disallowed_tools` | `[]` | Tools agents may never use, e.g. `["Artifact"]` |
+| `defaults.instructions` | `[]` | Files added to every agent's system prompt (lead, workers, stages, reviewers, solo; every harness), e.g. a standing-rules skill. Edits apply on the next run. |
 | `defaults.your_name` | `""` | What agents call you: "Notes from Izz", "Izz answered #3", and the tool they ask you with, `ask_izz`. Their tool descriptions and instructions use the name instead of "the human". Empty, it's "the human" and `ask_human`, so a config you share names nobody. Agents that learned the tool under an earlier name can still call it. |
 | `claude.command`, `claude.extra_args` | `"claude"`, `[]` | How agents are launched |
+| `opencode.command`, `opencode.model`, `opencode.agent`, `opencode.extra_args` | `"opencode"`, `""`, `""`, `[]` | How OpenCode agents are launched (OpenCode 2); the model is `provider/model`, and empty ones are OpenCode's defaults. `extra_args` go to headless runs only |
 | `codex.command`, `codex.model`, `codex.sandbox`, `codex.extra_args` | `"codex"`, `""`, `"workspace-write"`, `[]` | How Codex agents are launched; an empty model is Codex's default |
 | `notifications.enabled` | `true` | A macOS notification when something new lands in the Inbox while drovr is in the background |
 | `remote.enabled` | `false` | Serve the phone page while the app runs (see [Phone access](#phone-access)) |
@@ -648,27 +716,39 @@ drovr reads `~/.config/drovr/config.toml`. Every key is optional, and [`config.e
 | `watch.jira_poll_secs` | `300` | How often the watcher reads Jira |
 | `watch.pr_poll_secs` | `120` | How often it reads PRs (at most 60 while checks run) |
 | `watch.gh` | `"gh"` | The GitHub CLI |
-| `watch.rules.<rule>` | see [the table](#what-the-watcher-does-about-a-change) | `wake`, `ask` or `ignore` for `ci_failed`, `changes_requested`, `new_review`, `conflict`, `approved_green`, `merged`, `pr_closed`, `jira_changed` |
+| `watch.rules.<rule>` | see [the table](#what-the-watcher-does-about-a-change) | `wake`, `ask` or `ignore` for `ci_failed`, `ci_passed`, `changes_requested`, `new_review`, `ready_for_review`, `conflict`, `approved_green`, `merged`, `pr_closed`, `jira_changed` |
 | `watch.merged_transition` | `""` | When a ticket's PR merges, also draft moving the ticket with this transition (twg: its id) |
 | `watch.dispatch_transition` | `""` | When you dispatch a ticket, move it with this transition straight away (twg: the id of the move to In Progress) |
 | `jira.comment_cmd`, `jira.transition_cmd` | `""` | How drovr posts Jira drafts you approve (see [Jira drafts](#jira-drafts)) |
 | `confluence.page_get_cmd`, `.page_update_cmd`, `.page_create_cmd` | `""` | How drovr reads a Confluence page and saves an agent's page as a draft once you approve it (see [Pages agents write](#pages-agents-write)) |
 | `jira.ticket_skill` | `""` | The skill an agent follows to write a ticket for its own task (New agent → **Create a Jira ticket**), e.g. `"~/.claude/skills/ticket-writing/SKILL.md"`; empty asks for a summary, description and acceptance criteria |
 | `stages.order` | triage, research, blueprint, build, close | The ticket workflow's stages, in order |
-| `stages.models.<stage>` | none | The model a stage's agent runs on (e.g. `stages.models.triage = "claude-haiku-5-5"`) |
+| `stages.models.<stage>` | none | The model a stage's agent runs on (e.g. `stages.models.triage = "claude-haiku-5-5"`); `stages.models.review` is also the model of build reviewers and PR reviewers |
 | `stages.build_checkpoint_tokens` | `150000` | The build stage checkpoints and starts fresh past this much context; `0` turns it off |
 | `stages.build_checkpoint_usd` | `15` | …or once its session has cost this much; `0` turns it off |
 | `stages.tidy_on_close` | `true` | Remove stopped stage agents when the last stage's handoff is approved |
+| `stages.review` | `false` | Pair each build agent with a reviewer that runs alongside it, can't edit files, and proposes diffs to it (see [Reviews alongside the build](#stages)); its model is `stages.models.review` |
+| `stages.review_skill` | `""` | A SKILL.md the build reviewers and PR reviewers follow, e.g. `"~/.claude/skills/code-review/SKILL.md"`; empty, they review on their own |
 | `retro.model` | `""` | The retro agent's model; empty for the default |
 | `retro.skills_dir` | `"~/.claude/skills"` | Where approved skill proposals are written |
+| `retro.hide_decided` | `true` | Hide a ticket from the retro picker once you've decided every proposal of its retros, until there's new work on it |
 | `permissions.auto_allow` | read-only tools, `WebSearch` and `mcp__drovr__*` | Tools headless agents use without asking; a trailing `*` matches a prefix. `WebFetch` asks in the Inbox: with `Read` allowed too, an agent misled by text in a ticket, page or Slack message could otherwise send your files to any URL. Add it back if you accept that. |
 | `permissions.wait_seconds` | `900` | How long a permission request waits for you before it's denied |
 | `orchestrator.auto_spawn` | `true` | Start workers without asking first |
 | `orchestrator.max_workers` | `6` | Maximum number of workers per group |
 | `commands.timeout_seconds` | `600` | Time limit for commands you approve |
 | `reports.dir` | `"~/.claude/plans"` | Where reports are saved and listed |
+| `reports.archive_after_days` | `0` | Move plans whose newest file is older than this many days into `<reports.dir>/archive/`, whole and never deleted; `0` turns it off. Runs daily and from Settings → **Clean up now**. A group's folder, `retros`, `archive` symlinks and anything starting with `.` stay |
+| `inbox.keep_days` | `0` | Remove resolved Inbox items older than this many days, except an answer its agent hasn't received yet; `0` turns it off |
 | `datadog.pup` | `false` | Agents query Datadog with `pup`: read-only pup commands run without asking (with `--read-only` added), writes come to the Inbox (see [Datadog](#datadog)) |
 | `datadog.site` | `""` | Your Datadog site if it isn't US1, e.g. `"us5.datadoghq.com"`; passed to agents and lookups as `DD_SITE` |
+| `review.slack_channels` | `[]` | Channels to watch for GitHub PR links, e.g. `["#sre-reviews"]` (see [Review PRs from Slack and GitHub](#review-prs-from-slack-and-github)) |
+| `review.github_teams` | `[]` | Teams whose review requests to follow, as `org/team` |
+| `review.poll_secs` | `600` | How often to look; `0` turns it off. Finding PRs needs a channel or a team; removing closed reviewers doesn't |
+| `review.auto_dispatch` | `false` | Start a reviewer without asking |
+| `review.remove_when_closed` | `true` | Remove a reviewer that isn't working, and its worktree, once its PR merges or closes |
+| `review.repos_dir` | `""` | Where your local clones live, as `<repos_dir>/<repo>`; empty means `defaults.cwd` |
+| `review.owners` | `[]` | Only review PRs in these GitHub orgs or users; empty is any |
 | `memory.dir` | `""` | An auto memory folder every Claude Code agent reads, wherever it works; leads and solo agents write it, and workers send what's worth keeping to their lead (see [Shared memory](#shared-memory)). Empty: Claude Code's own memory per project |
 | `[herdr]` | herdr's documented CLI | The herdr command templates (see below) |
 | `jira`, `confluence`, `slack` | `provider = "agent"` | How lookups reach each service (see below) |
@@ -717,7 +797,7 @@ The `[herdr]` keys are command templates. Values substituted into `{placeholders
 | `split` | `{herdr} pane split --current --direction right --cwd {cwd} --no-focus` |
 | `agent_pane` | `{herdr} tab create --cwd {cwd} --label {name} --no-focus`: opens the pane an agent starts in |
 | `list` | `{herdr} pane list`: finds the focused pane (see below) |
-| `start` | `{herdr} agent start {name} --kind claude --pane {pane} --timeout 60000 -- {args}` |
+| `start` | `{herdr} agent start {name} --kind {kind} --pane {pane} --timeout 60000 -- {args}`: `{kind}` is `claude` or `opencode`. A template that still says `--kind claude` gets the agent's kind in its place. |
 | `run` | `{herdr} pane run {pane} {cmd}` |
 | `prompt` | `{herdr} agent prompt {target} {text}` |
 | `read` | `{herdr} agent read {target} --source recent-unwrapped --lines {lines}` |
@@ -739,7 +819,7 @@ If your herdr version takes different arguments, edit these templates instead of
 | `DROVR_CONFIG` | Use another config file |
 | `DROVR_HOME` | Use another state folder (default `~/.local/share/drovr`) |
 | `DROVR_BIN` | Path to the `drovr` CLI that agents run (default: the copy bundled in the app) |
-| `DROVR_KEEP_PATH` | Don't load PATH from your login shell at startup |
+| `DROVR_KEEP_PATH` | Keep the PATH drovr was launched with instead of asking your login shell (the common folders, such as `/opt/homebrew/bin`, are still added) |
 | `DROVR_AGENT` | Set by drovr inside each agent's process; you don't set this |
 
 ## Files and data
@@ -765,8 +845,12 @@ Everything in the app is also scriptable with the `drovr` CLI, from a shell, a h
 drovr ls                                  # agents and their state
 drovr dispatch SRE-3253 to pay-api        # hand a ticket to an existing group's lead
 drovr inbox && drovr answer 7 "24h"       # see and answer what's waiting on you
-drovr adopt <session-id> my-agent         # continue a Claude Code session as a drovr agent
+drovr adopt <session-id> my-agent         # continue a Claude Code (or OpenCode ses_…) session as a drovr agent
+drovr new --harness opencode fix-ci ~/code/api "Make CI green"   # an OpenCode agent
 drovr new --harness codex fix-ci ~/code/api "Make CI green"   # a Codex agent (experimental)
+drovr cleanup --dry-run                   # what archiving old plans and pruning the Inbox would do
+drovr review https://github.com/o/r/pull/7   # start a read-only reviewer for a PR
+drovr review poll                         # look now for PRs to review
 drovr config                              # where drovr reads its config and keeps its data
 drovr remote                              # the phone page's sign-in link and QR code
 ```
@@ -793,7 +877,7 @@ pnpm tauri:build:signed              # signed + notarized
 
 **CI:** three workflows, with every action pinned to a full commit SHA.
 
-- **Pull requests** (`.github/workflows/ci.yml`): fast checks on Apple Silicon: core tests, the type-check, the app tests and clippy (any warning fails it), using a debug build and no bundle. Its `check` job is required to merge, with no bypass. A PR that only touches docs skips the job, which counts as passing, and a newer push cancels the run in progress.
+- **Pull requests** (`.github/workflows/ci.yml`): fast checks on Apple Silicon: core tests, the type-check, the app tests and clippy (any warning fails it), using a debug build and no bundle. Its `check` job is required to merge, with no bypass. A PR that only touches docs skips the job, which counts as passing, and a newer push cancels the run in progress. It also runs on `main`, where it saves the Rust build cache that pull requests restore.
 - **Release PR** (`.github/workflows/release-please.yml`): every push to `main` updates a release PR kept by [release-please](https://github.com/googleapis/release-please). It holds the next version, worked out from Conventional Commit messages (`fix:` bumps the patch, `feat:` the minor, `feat!:` or `BREAKING CHANGE:` the major, or the minor before 1.0), the new `CHANGELOG.md` entry, and that version in `tauri.conf.json`, `package.json`, the three `Cargo.toml` files, `Cargo.lock` and this README. Commits of other types (`docs:`, `chore:`, `ci:`) don't make a release on their own. The built-in token's PRs don't trigger CI, so the workflow starts CI on the release PR itself, which skips `check` there: the PR only bumps versions and the changelog, and everything in it was tested when it merged. The release build still compiles and verifies the app after the release PR merges.
 - **Releases** (`.github/workflows/release.yml`): merging the release PR tags it and creates the GitHub Release, then this workflow builds a signed, notarized `drovr.app` and `.dmg`, verifies them, and attaches the `.dmg` to that release. The release is titled `drovr-<version>`. It's the only way to release: pushing a `v*` tag by hand builds nothing, and a ruleset stops anyone moving or deleting one. The secrets it needs are listed in [docs/signing.md](docs/signing.md#releasing-from-ci).
 
@@ -803,7 +887,8 @@ pnpm tauri:build:signed              # signed + notarized
 crates/drovr-core    state, engine, MCP server, sources, reports, review
 crates/drovr-cli     the `drovr` binary (MCP server, run hook, scripting)
 app/src              Svelte UI (views in src/lib/components/)
-app/src-tauri        Tauri shell: commands, menu, themes; icons/ (icon.svg is the source)
+app/src/lib/themes.json   the themes: colors and lettering
+app/src-tauri        Tauri shell: commands, menu, themes.rs; icons/ (icon.svg is the source)
 scripts/             build-signed.sh
 docs/                signing.md, screenshots, icon
 USAGE.md             commands and workflows

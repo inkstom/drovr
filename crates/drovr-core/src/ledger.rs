@@ -78,10 +78,17 @@ pub fn append(cfg: &Config, folder: &str, ticket: &str, event: &Value) -> Result
 
 /// Holds an flock until dropped, so lines from several processes don't
 /// interleave.
-struct Lock(i32);
+pub(crate) struct Lock(i32);
 
 impl Lock {
-    fn exclusive(f: &std::fs::File) -> Lock {
+    /// The lock if nobody holds it, without waiting.
+    pub(crate) fn try_exclusive(f: &std::fs::File) -> Option<Lock> {
+        use std::os::unix::io::AsRawFd;
+        let fd = f.as_raw_fd();
+        (unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } == 0).then_some(Lock(fd))
+    }
+
+    pub(crate) fn exclusive(f: &std::fs::File) -> Lock {
         use std::os::unix::io::AsRawFd;
         let fd = f.as_raw_fd();
         unsafe { libc::flock(fd, libc::LOCK_EX) };
@@ -116,14 +123,25 @@ pub struct Record {
     pub updated: f64,
     /// When its last retro started; 0 if it's never had one.
     pub last_retro: f64,
-    /// Its latest event that isn't a retro's own.
+    /// Its latest event that's work on it.
     pub last_work: f64,
 }
 
-/// A retro's own events, which aren't work on the ticket.
-fn is_retro_event(kind: &str) -> bool {
-    kind.starts_with("retro_") || kind.starts_with("proposal_")
+/// Whether an event is agents, PRs or reviews moving, rather than a retro's
+/// own, Jira's or cleanup.
+pub fn is_work(e: &Value) -> bool {
+    let kind = e["kind"].as_str().unwrap_or("");
+    let others = ["retro_", "proposal_", "jira_", "sprint_"];
+    let cleanup = matches!(
+        kind,
+        "agent_removed" | "stopped" | "unqueued" | "wake_paused"
+    );
+    let dismissed = kind == "answered" && e["status"] == "dismissed";
+    !others.iter().any(|p| kind.starts_with(p)) && !cleanup && !dismissed
 }
+
+/// The plans folder's subfolder that holds archived plans; listings skip it.
+pub const ARCHIVE: &str = "archive";
 
 /// Every record in the plans folder, most recently updated first.
 pub fn list(cfg: &Config) -> Vec<Record> {
@@ -143,7 +161,7 @@ pub fn list(cfg: &Config) -> Vec<Record> {
             let ts = e["ts"].as_f64().unwrap_or(0.0);
             match e["kind"].as_str().unwrap_or("") {
                 "retro_started" => last_retro = last_retro.max(ts),
-                k if is_retro_event(k) => {}
+                _ if !is_work(&e) => {}
                 _ => last_work = last_work.max(ts),
             }
         }
@@ -164,6 +182,9 @@ pub fn list(cfg: &Config) -> Vec<Record> {
     };
     for entry in subdirs(&root) {
         let name = entry.file_name().to_string_lossy().to_string();
+        if name == ARCHIVE {
+            continue;
+        }
         if is_record(&entry.path()) {
             add(&entry.path(), "", &name);
             continue;
@@ -174,6 +195,24 @@ pub fn list(cfg: &Config) -> Vec<Record> {
     }
     out.sort_by(|a, b| b.updated.total_cmp(&a.updated));
     out
+}
+
+/// The plans folder's subfolder whose record of `ticket` was written to last
+/// (empty for the plans folder itself), or None when it has no record.
+pub fn latest_folder(cfg: &Config, ticket: &str) -> Option<String> {
+    let root = cfg.reports.path();
+    subdirs(&root)
+        .filter(|d| !is_record(&d.path()))
+        .map(|d| d.file_name().to_string_lossy().to_string())
+        .filter(|name| name != ARCHIVE)
+        .chain([String::new()])
+        .filter_map(|folder| {
+            let file = dir(cfg, &folder, ticket).join(FILE);
+            let written = std::fs::metadata(file).ok()?.modified().ok()?;
+            Some((written, folder))
+        })
+        .max()
+        .map(|(_, folder)| folder)
 }
 
 /// Whether `dir` is a ticket's record folder rather than a group's plans folder.

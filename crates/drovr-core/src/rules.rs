@@ -1,7 +1,7 @@
 //! What the watcher does about a change it saw (`watch.rules`): `wake` the
 //! agent that owns the work with what it needs to act (the failing log,
 //! the review), `ask` you in the Inbox first, or `ignore` it. Each trigger
-//! fires once per PR head, so a failure that stays failed doesn't wake an
+//! fires once per PR head (`new_review` once per review), so a failure that stays failed doesn't wake an
 //! agent again until it pushes.
 
 use crate::engine::{truncate, Engine};
@@ -56,6 +56,12 @@ pub fn on_pr(engine: &Engine, before: &Pr, pr: &mut Pr) {
     if pr.ci == "failure" && before.ci != "failure" {
         triggers.push("ci_failed");
     }
+    if pr.state == "OPEN"
+        && pr.ci == "success"
+        && matches!(before.ci.as_str(), "pending" | "failure")
+    {
+        triggers.push("ci_passed");
+    }
     if pr.review == "CHANGES_REQUESTED" && before.review != "CHANGES_REQUESTED" {
         triggers.push("changes_requested");
     } else if pr.reviews > before.reviews && pr.review != "APPROVED" {
@@ -68,6 +74,14 @@ pub fn on_pr(engine: &Engine, before: &Pr, pr: &mut Pr) {
     if green(pr) && !green(before) {
         triggers.push("approved_green");
     }
+    if pr.state == "OPEN"
+        && !pr.draft
+        && matches!(pr.ci.as_str(), "success" | "none")
+        && pr.mergeable == "MERGEABLE"
+        && !matches!(pr.review.as_str(), "APPROVED" | "CHANGES_REQUESTED")
+    {
+        triggers.push("ready_for_review");
+    }
     if pr.state == "MERGED" && before.state != "MERGED" {
         triggers.push("merged");
     }
@@ -75,7 +89,11 @@ pub fn on_pr(engine: &Engine, before: &Pr, pr: &mut Pr) {
         triggers.push("pr_closed");
     }
     for trigger in triggers {
-        let key = format!("{trigger}@{}", pr.head);
+        let key = if trigger == "new_review" {
+            format!("new_review@{}#{}", pr.head, pr.reviews)
+        } else {
+            format!("{trigger}@{}", pr.head)
+        };
         if pr.fired.contains(&key) {
             continue;
         }
@@ -153,6 +171,8 @@ pub fn on_ticket(engine: &Engine, t: &Ticket, changes: &[(&'static str, Value)])
 fn headline(trigger: &str) -> &'static str {
     match trigger {
         "ci_failed" => "CI failed",
+        "ci_passed" => "CI passed",
+        "ready_for_review" => "green, waiting on review",
         "changes_requested" => "changes requested",
         "new_review" => "new review",
         "conflict" => "merge conflict",
@@ -263,6 +283,15 @@ fn pr_text(engine: &Engine, trigger: &str, pr: &Pr) -> (String, String) {
                     .into(),
             )
         }
+        "ci_passed" => (
+            head + "\nIts checks all passed.",
+            "Continue with what you were waiting on for this PR. If nothing is left, say so."
+                .into(),
+        ),
+        "ready_for_review" => (
+            head + "\nIts checks pass and it has no conflicts; it needs a review.",
+            String::new(),
+        ),
         "conflict" => (
             head,
             "Merge the base branch in, resolve the conflicts, run the checks, and push.".into(),
@@ -302,66 +331,89 @@ fn tail_chars(s: &str, max: usize) -> String {
     }
 }
 
-/// The latest reviews and review comments on a PR.
+/// A PR's review threads, a page at a time (`gh api graphql --paginate`).
+const THREADS: &str =
+    "query($owner: String!, $name: String!, $number: Int!, $endCursor: String) { \
+    repository(owner: $owner, name: $name) { pullRequest(number: $number) { \
+    reviewThreads(first: 100, after: $endCursor) { pageInfo { hasNextPage endCursor } \
+    nodes { isResolved isOutdated path line originalLine \
+    comments(first: 20) { nodes { author { login } body } } } } } } }";
+
+/// Each reviewer's latest review, and every unresolved review thread on a PR.
 fn reviews(gh: &str, pr: &Pr) -> Option<String> {
+    let run = |cmd: &str| shell::sh(cmd, None, None, Duration::from_secs(60)).ok();
+    let login = |v: &Value| v["author"]["login"].as_str().unwrap_or("?").to_string();
+    let text = |v: &Value, max: usize| truncate(v["body"].as_str().unwrap_or("").trim(), max);
     let mut out = String::new();
-    let v = shell::sh(
-        &format!("{gh} pr view {} --json reviews", quote(&pr.url)),
-        None,
-        None,
-        Duration::from_secs(60),
-    )
-    .ok()
-    .and_then(|o| serde_json::from_str::<Value>(&o.stdout).ok());
-    for r in v
-        .as_ref()
-        .and_then(|v| v["reviews"].as_array())
-        .into_iter()
-        .flatten()
-        .rev()
-        .take(3)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-    {
+
+    let v = run(&format!("{gh} pr view {} --json reviews", quote(&pr.url)))
+        .and_then(|o| serde_json::from_str::<Value>(&o.stdout).ok())
+        .unwrap_or_default();
+    let mut latest: Vec<&Value> = vec![];
+    for r in v["reviews"].as_array().into_iter().flatten() {
+        latest.retain(|l| login(l) != login(r));
+        latest.push(r);
+    }
+    for r in latest {
         out += &format!(
             "Review by {} ({}): {}\n",
-            r["author"]["login"].as_str().unwrap_or("?"),
+            login(r),
             r["state"].as_str().unwrap_or(""),
-            truncate(r["body"].as_str().unwrap_or("").trim(), 2000)
+            text(r, 2000)
         );
     }
-    let c = shell::sh(
-        &format!(
-            "{gh} api {}",
-            quote(&format!(
-                "repos/{}/pulls/{}/comments?per_page=100",
-                pr.repo, pr.number
-            ))
-        ),
-        None,
-        None,
-        Duration::from_secs(60),
-    )
-    .ok()
-    .and_then(|o| serde_json::from_str::<Value>(&o.stdout).ok());
-    let comments: Vec<&Value> = c
-        .as_ref()
-        .and_then(|v| v.as_array())
-        .into_iter()
-        .flatten()
-        .collect();
-    for cm in comments.iter().rev().take(10).rev() {
-        out += &format!(
-            "- {}:{} {}: {}\n",
-            cm["path"].as_str().unwrap_or(""),
-            cm["line"]
-                .as_u64()
-                .or_else(|| cm["original_line"].as_u64())
-                .unwrap_or(0),
-            cm["user"]["login"].as_str().unwrap_or("?"),
-            truncate(cm["body"].as_str().unwrap_or("").trim(), 1000)
-        );
+
+    let (owner, name) = pr.repo.split_once('/').unwrap_or_default();
+    let pages = run(&format!(
+        "{gh} api graphql --paginate -f query={} -f owner={} -f name={} -F number={}",
+        quote(THREADS),
+        quote(owner),
+        quote(name),
+        pr.number
+    ))
+    .map(|o| o.stdout)
+    .unwrap_or_default();
+    let (mut read, mut missed) = (0, false);
+    let mut open: Vec<Value> = vec![];
+    for page in serde_json::Deserializer::from_str(&pages).into_iter::<Value>() {
+        let nodes = page.ok().and_then(|p| {
+            p["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]
+                .as_array()
+                .cloned()
+        });
+        match nodes {
+            Some(n) => {
+                read += 1;
+                open.extend(n.into_iter().filter(|t| t["isResolved"] != true));
+            }
+            None => missed = true,
+        }
+    }
+    if !open.is_empty() {
+        out += &format!("\n{} unresolved review threads:\n", open.len());
+    }
+    for t in &open {
+        let line = t["line"].as_u64().or_else(|| t["originalLine"].as_u64());
+        let mut place = format!("{}:{}", t["path"].as_str().unwrap_or(""), line.unwrap_or(0));
+        if t["isOutdated"] == true {
+            place += " (outdated)";
+        }
+        for (i, c) in t["comments"]["nodes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
+            let at = if i == 0 {
+                format!("- {place}")
+            } else {
+                "  reply by".into()
+            };
+            out += &format!("{at} {}: {}\n", login(c), text(c, 1000));
+        }
+    }
+    if read == 0 || missed {
+        out += "\ndrovr couldn't read all of the review threads; read them on the PR.\n";
     }
     (!out.is_empty()).then_some(out)
 }
@@ -450,7 +502,7 @@ pub fn draft_jira(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
+    use crate::config::{Config, Rules};
     use crate::store::Store;
 
     fn setup(name: &str) -> (std::path::PathBuf, Engine) {
@@ -487,6 +539,192 @@ mod tests {
             head: "a1".into(),
             ..Pr::default()
         }
+    }
+
+    fn asking(engine: &mut Engine) {
+        let r = &mut engine.cfg.watch.rules;
+        r.ci_passed = "ask".into();
+        r.ready_for_review = "ask".into();
+        r.new_review = "ask".into();
+    }
+
+    fn fake_gh(dir: &std::path::Path, reviews: &Value, threads: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(dir.join("reviews.json"), reviews.to_string()).unwrap();
+        std::fs::write(dir.join("threads.json"), threads).unwrap();
+        let d = dir.display();
+        let gh = dir.join("gh");
+        std::fs::write(
+            &gh,
+            format!("#!/bin/sh\ncase \"$1 $2\" in\n\"pr view\") cat {d}/reviews.json;;\n\"api graphql\") cat {d}/threads.json;;\nesac\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        gh.display().to_string()
+    }
+
+    fn thread(n: usize, resolved: bool, outdated: bool) -> Value {
+        json!({ "isResolved": resolved, "isOutdated": outdated, "path": "a.rs", "line": n, "originalLine": n,
+                "comments": { "nodes": [
+                    { "author": { "login": "bot" }, "body": format!("finding {n}.") },
+                    { "author": null, "body": format!("reply {n}.") }
+                ] } })
+    }
+
+    fn threads_page(threads: Vec<Value>) -> String {
+        json!({ "data": { "repository": { "pullRequest": { "reviewThreads": { "nodes": threads } } } } })
+            .to_string()
+    }
+
+    #[test]
+    fn sends_every_unresolved_thread() {
+        let (dir, _engine) = setup("threads");
+        // Two pages, as `gh api graphql --paginate` prints them.
+        let pages = [
+            threads_page((1..=100).map(|n| thread(n, n == 2, n == 3)).collect()),
+            threads_page(vec![thread(101, false, false)]),
+        ]
+        .concat();
+        let gh = fake_gh(&dir, &json!({ "reviews": [] }), &pages);
+        let pr = pr("success", "REVIEW_REQUIRED", "MERGEABLE", "OPEN");
+        let text = reviews(&quote(&gh), &pr).unwrap();
+        for n in [1, 3, 50, 100, 101] {
+            assert!(text.contains(&format!("finding {n}.")), "{n}");
+            assert!(text.contains(&format!("reply {n}.")), "{n}");
+        }
+        assert!(!text.contains("finding 2."), "resolved");
+        assert!(text.contains("a.rs:3 (outdated)"));
+        assert!(text.contains("100 unresolved"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn sends_each_reviewers_latest_review() {
+        let (dir, _engine) = setup("latest-reviews");
+        let review = |who: &str, body: &str| json!({ "author": { "login": who }, "state": "COMMENTED", "body": body });
+        let all = json!({ "reviews": [
+            review("ann", "ann early"), review("bot-a", "a"), review("bot-b", "b"),
+            review("bot-c", "c"), review("ann", "ann late"), review("bot-d", "d")
+        ] });
+        let gh = fake_gh(&dir, &all, &threads_page(vec![]));
+        let pr = pr("success", "REVIEW_REQUIRED", "MERGEABLE", "OPEN");
+        let text = reviews(&quote(&gh), &pr).unwrap();
+        for who in ["bot-a", "bot-b", "bot-c", "bot-d"] {
+            assert!(text.contains(&format!("Review by {who}")), "{who}");
+        }
+        assert!(text.contains("ann late") && !text.contains("ann early"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn says_when_review_comments_could_not_be_read() {
+        let (dir, _engine) = setup("threads-fail");
+        let pr = pr("success", "REVIEW_REQUIRED", "MERGEABLE", "OPEN");
+        for bad in ["", "{\"errors\":[{\"message\":\"no\"}]}"] {
+            let gh = fake_gh(&dir, &json!({ "reviews": [] }), bad);
+            let text = reviews(&quote(&gh), &pr).unwrap_or_default();
+            assert!(text.contains("couldn't read"), "{bad:?}: {text}");
+        }
+        // Nothing to say when there's nothing.
+        let gh = fake_gh(&dir, &json!({ "reviews": [] }), &threads_page(vec![]));
+        assert_eq!(reviews(&quote(&gh), &pr), None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn ci_passed_fires_when_checks_turn_green() {
+        let (dir, mut engine) = setup("ci-passed");
+        asking(&mut engine);
+        for from in ["pending", "failure"] {
+            let before = pr(from, "REVIEW_REQUIRED", "MERGEABLE", "OPEN");
+            let mut now = pr("success", "REVIEW_REQUIRED", "MERGEABLE", "OPEN");
+            on_pr(&engine, &before, &mut now);
+            assert!(now.fired.contains(&"ci_passed@a1".to_string()), "{from}");
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn ci_passed_ignores_a_pr_seen_green_first() {
+        let (dir, mut engine) = setup("ci-first");
+        asking(&mut engine);
+        let before = Pr {
+            state: "OPEN".into(),
+            ..Pr::default()
+        };
+        let mut now = pr("success", "REVIEW_REQUIRED", "MERGEABLE", "OPEN");
+        on_pr(&engine, &before, &mut now);
+        assert!(!now.fired.iter().any(|k| k.starts_with("ci_passed@")));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn ready_for_review_fires_once_per_head() {
+        let (dir, mut engine) = setup("ready");
+        asking(&mut engine);
+        let before = pr("success", "REVIEW_REQUIRED", "MERGEABLE", "OPEN");
+        let mut now = before.clone();
+        on_pr(&engine, &before, &mut now);
+        assert_eq!(now.fired, ["ready_for_review@a1"]);
+        on_pr(&engine, &before, &mut now);
+        assert_eq!(engine.store.items(Some("pending"), 50).unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn ready_for_review_needs_green_mergeable_and_no_decision() {
+        let (dir, mut engine) = setup("ready-not");
+        asking(&mut engine);
+        let fires = |engine: &Engine, now: &Pr| {
+            let mut now = now.clone();
+            on_pr(engine, &now.clone(), &mut now);
+            now.fired.contains(&"ready_for_review@a1".to_string())
+        };
+        let base = pr("success", "REVIEW_REQUIRED", "MERGEABLE", "OPEN");
+        let mut draft = base.clone();
+        draft.draft = true;
+        assert!(!fires(&engine, &draft));
+        for review in ["CHANGES_REQUESTED", "APPROVED"] {
+            let p = pr("success", review, "MERGEABLE", "OPEN");
+            assert!(!fires(&engine, &p), "{review}");
+        }
+        assert!(!fires(
+            &engine,
+            &pr("success", "REVIEW_REQUIRED", "CONFLICTING", "OPEN")
+        ));
+        for ci in ["failure", "pending"] {
+            let p = pr(ci, "REVIEW_REQUIRED", "MERGEABLE", "OPEN");
+            assert!(!fires(&engine, &p), "{ci}");
+        }
+        assert!(fires(
+            &engine,
+            &pr("none", "REVIEW_REQUIRED", "MERGEABLE", "OPEN")
+        ));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn new_review_fires_for_each_review_on_a_head() {
+        let (dir, mut engine) = setup("each-review");
+        asking(&mut engine);
+        let mut before = pr("pending", "REVIEW_REQUIRED", "MERGEABLE", "OPEN");
+        before.reviews = 0;
+        let mut now = before.clone();
+        now.reviews = 1;
+        on_pr(&engine, &before, &mut now);
+        assert!(now.fired.contains(&"new_review@a1#1".to_string()));
+        let before = now.clone();
+        now.reviews = 2;
+        on_pr(&engine, &before, &mut now);
+        assert!(now.fired.contains(&"new_review@a1#2".to_string()));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn default_rules_for_new_triggers() {
+        let r = Rules::default();
+        assert_eq!(r.action("ci_passed"), "wake");
+        assert_eq!(r.action("ready_for_review"), "ask");
     }
 
     #[test]
@@ -577,9 +815,9 @@ mod tests {
             .unwrap();
         assert!(engine.answer(mv.id, "Complete").is_err());
         assert_eq!(engine.store.item(mv.id).unwrap().unwrap().status, "pending");
-        // All of it is in the ticket's record.
+        // All of it is in the ticket's record (CI failed, CI passed, ready to merge, merged, two Jira drafts).
         let t = ledger::timeline(&engine.cfg, "SRE-3229");
-        assert_eq!(t.iter().filter(|e| e["kind"] == "asked").count(), 5);
+        assert_eq!(t.iter().filter(|e| e["kind"] == "asked").count(), 6);
         assert_eq!(t.iter().filter(|e| e["kind"] == "answered").count(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }

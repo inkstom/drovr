@@ -8,7 +8,7 @@
 //!   through the herdr CLI (templates in config).
 
 use crate::config::{expand_tilde, home, Config};
-use crate::harness::{self, Costs, Event, Harness, Run, Session};
+use crate::harness::{self, Costs, Event, Harness, Run, Session, Transcript};
 use crate::ledger;
 use crate::prompts;
 use crate::shell::{self, quote};
@@ -16,7 +16,7 @@ use crate::store::{Agent, Item, Store};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -51,6 +51,12 @@ struct HerdrRun {
     total: f64,
     run_cost: f64,
     started: f64,
+    /// When drovr last started the agent in a pane: a CLI that names its
+    /// own sessions starts one after this.
+    opened: f64,
+    /// What herdr last said the agent was doing (`blocked`: waiting for
+    /// you in its pane).
+    status: String,
 }
 
 /// Save what an agent's status line was given, for `refresh_herdr` to read.
@@ -390,6 +396,76 @@ fn remove_worktree(dir: &Path, name: &str) -> String {
     }
 }
 
+/// Remove a PR reviewer's folder: its `pr` worktree and branch, uncommitted
+/// files and all, then the folder around them. It never holds work worth
+/// keeping.
+fn remove_pr_worktree(dir: &Path, name: &str) -> String {
+    let pr = dir.join("pr");
+    if let Some(main) = git_common_dir(&pr).and_then(|c| c.parent().map(Path::to_path_buf)) {
+        let _ = git_in(
+            &main,
+            &format!(
+                "worktree remove --force {}",
+                quote(&pr.display().to_string())
+            ),
+        );
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = git_in(
+            &main,
+            &format!("branch -D {}", quote(&format!("drovr/{name}"))),
+        );
+        let _ = git_in(&main, "worktree prune");
+    } else {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    "Its worktree and branch were removed.".into()
+}
+
+/// Whether a git remote URL (https or ssh) points at GitHub's `owner/repo`.
+pub(crate) fn remote_is(url: &str, owner: &str, repo: &str) -> bool {
+    let url = url.trim().to_lowercase();
+    let url = url.strip_suffix(".git").unwrap_or(&url);
+    let Some(i) = url.find("github.com") else {
+        return false;
+    };
+    let rest = &url[i + "github.com".len()..];
+    let Some(path) = rest.strip_prefix('/').or_else(|| rest.strip_prefix(':')) else {
+        return false;
+    };
+    path.trim_end_matches('/') == format!("{}/{}", owner.to_lowercase(), repo.to_lowercase())
+}
+
+/// The clone's first remote that points at `owner/repo`. The clone must be
+/// a repo of its own, not a folder inside another one. Remote URLs are read
+/// from the config as written, before any `insteadOf` rewriting.
+fn pr_remote(clone: &Path, owner: &str, repo: &str) -> Result<String> {
+    let top = git_in(clone, "rev-parse --show-toplevel")?;
+    let same = top.ok()
+        && std::fs::canonicalize(top.stdout.trim()).ok() == std::fs::canonicalize(clone).ok();
+    if !same {
+        bail!(
+            "{} isn't a git clone; remove it or set review.repos_dir",
+            clone.display()
+        );
+    }
+    let out = git_in(clone, "config --get-regexp '^remote\\..*\\.url$'")?;
+    for line in out.stdout.lines() {
+        let Some((key, url)) = line.split_once(' ') else {
+            continue;
+        };
+        let name = key
+            .strip_prefix("remote.")
+            .and_then(|k| k.strip_suffix(".url"));
+        if let Some(name) = name.filter(|_| remote_is(url, owner, repo)) {
+            return Ok(name.to_string());
+        }
+    }
+    bail!(
+        "{} has no remote for {owner}/{repo}; add one or set review.repos_dir",
+        clone.display()
+    )
+}
+
 /// A worker's name: `<group>-<name>`, cut to fit the 40-character limit.
 fn worker_name(group: &str, name: &str) -> String {
     let base = slug(name);
@@ -484,25 +560,44 @@ impl Engine {
         Ok(crate::review::repos(&a.cwd, &self.transcripts(&a), &shared))
     }
 
-    /// What an agent's headless runs cost, from their logs. Only Claude Code
-    /// reports a cost; Codex reports tokens.
+    /// What an agent's headless runs cost, from their logs. Claude Code and
+    /// OpenCode report a cost; Codex reports tokens.
     fn total_cost(&self, agent: &Agent) -> f64 {
+        self.run_costs(agent)
+            .into_iter()
+            .map(|(_, cost)| cost)
+            .sum()
+    }
+
+    /// Each headless run's session and what the run cost, in order.
+    fn run_costs(&self, agent: &Agent) -> Vec<(String, f64)> {
         let harness = harness::of(agent);
         let dir = home().join("agents").join(&agent.name).join("runs");
         let mut costs = Costs::default();
         (1..=agent.runs)
             .filter_map(|r| std::fs::read_to_string(dir.join(format!("{r}.jsonl"))).ok())
-            .filter_map(|log| {
-                log.lines()
-                    .rev()
-                    .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-                    .find_map(|v| match harness.parse(&v) {
-                        Event::End(end) => Some(end),
-                        _ => None,
-                    })
+            .filter_map(|log| run_end(&log, harness))
+            .map(|end| {
+                let cost = harness.run_cost(&end, &mut costs).unwrap_or(0.0);
+                (end["session_id"].as_str().unwrap_or("").to_string(), cost)
             })
-            .map(|end| harness.run_cost(&end, &mut costs).unwrap_or(0.0))
-            .sum()
+            .collect()
+    }
+
+    /// What the last headless run cost by model, where its CLI says.
+    fn last_model_costs(&self, agent: &Agent) -> BTreeMap<String, f64> {
+        let harness = harness::of(agent);
+        let dir = home().join("agents").join(&agent.name).join("runs");
+        let mut costs = Costs::default();
+        let mut last = BTreeMap::new();
+        for run in 1..=agent.runs {
+            last = std::fs::read_to_string(dir.join(format!("{run}.jsonl")))
+                .ok()
+                .and_then(|log| run_end(&log, harness))
+                .map(|end| harness.run_model_costs(&end, &mut costs))
+                .unwrap_or_default();
+        }
+        last
     }
 
     pub(crate) fn agent_dir(&self, name: &str) -> PathBuf {
@@ -573,6 +668,23 @@ impl Engine {
                 .enabled
                 .then_some(self.cfg.stages.order.as_slice()),
         );
+        if self.cfg.stages.review && self.staged(agent) {
+            // A reviewer's name is its builder's, maybe cut short, so find
+            // the builder the other way round.
+            let pair = if agent.stage == crate::config::REVIEW {
+                peers
+                    .iter()
+                    .find(|p| crate::config::reviewer_name(&p.name) == agent.name)
+                    .map(|p| p.name.clone())
+                    .unwrap_or_default()
+            } else {
+                crate::config::reviewer_name(&agent.name)
+            };
+            text += &crate::config::personalize(
+                &prompts::review_prompt(agent, &pair, &self.cfg.stages.review_skill),
+                &self.cfg.your_name(),
+            );
+        }
         if self.cfg.datadog.pup {
             text += &crate::config::personalize(crate::datadog::PROMPT, &self.cfg.your_name());
         }
@@ -583,9 +695,60 @@ impl Engine {
                 &self.cfg.your_name(),
             );
         }
+        text += &self.standing_instructions();
         let path = self.agent_dir(&agent.name).join("system.md");
         std::fs::write(&path, text)?;
         Ok(path)
+    }
+
+    /// `defaults.instructions` as a prompt section, read fresh on every run.
+    fn standing_instructions(&self) -> String {
+        let files = &self.cfg.defaults.instructions;
+        if files.is_empty() {
+            return String::new();
+        }
+        let you = self.cfg.your_name();
+        let mut out = crate::config::personalize(
+            &format!(
+                "\n## Standing instructions\n\n{you} wants these followed in all your work. They override any general habits.\n"
+            ),
+            &you,
+        );
+        let mut used = 0;
+        for file in files {
+            let path = crate::config::expand_tilde(file);
+            let name = std::path::Path::new(&path)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.clone());
+            // A skill's file is SKILL.md; its folder is the name that means something.
+            let name = if name == "SKILL.md" {
+                std::path::Path::new(&path)
+                    .parent()
+                    .and_then(|p| p.file_name())
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or(name)
+            } else {
+                name
+            };
+            match std::fs::read_to_string(&path) {
+                Ok(raw) => {
+                    let body = truncate(&prompts::instruction_text(&raw), 20_000);
+                    used += body.chars().count();
+                    if used > 60_000 {
+                        out += "\n- drovr left out the rest: standing instructions are capped at 60,000 characters.\n";
+                        break;
+                    }
+                    out += &format!("\n### {name}\n\n{body}\n");
+                }
+                Err(e) => {
+                    out += &format!(
+                        "\n### {name}\n\n- drovr couldn't read {path} ({e}). Tell {you}.\n"
+                    );
+                }
+            }
+        }
+        out
     }
 
     fn make_worktree(&self, cwd: &str, name: &str) -> Result<String> {
@@ -634,8 +797,14 @@ impl Engine {
         if !Path::new(&cwd).is_dir() {
             bail!("working directory {cwd} does not exist");
         }
-        // A retro works in its own folder under the plans, never a worktree.
-        if self.cfg.defaults.worktrees && resumed.is_none() && spec.stage != "retro" {
+        // A retro works in its own folder under the plans, never a worktree;
+        // a reviewer works in its builder's.
+        if self.cfg.defaults.worktrees
+            && resumed.is_none()
+            && spec.stage != "retro"
+            && spec.stage != crate::config::REVIEW
+            && spec.role != "pr-reviewer"
+        {
             cwd = self.make_worktree(&cwd, &spec.name)?;
         }
         let agent = Agent {
@@ -650,7 +819,7 @@ impl Engine {
             harness: harness.name().into(),
             run_state: "idle".into(),
             cwd,
-            // Codex names the session when the first run starts.
+            // Codex and OpenCode name the session when the first run starts.
             session_id: match &resumed {
                 Some(s) => s.id.clone(),
                 None if harness.picks_session_id() => uuid::Uuid::new_v4().to_string(),
@@ -708,7 +877,279 @@ impl Engine {
         } else {
             self.prompt(&agent.name, &task)?;
         }
-        self.agent(&agent.name)
+        let agent = self.agent(&agent.name)?;
+        if self.reviewed(&agent) {
+            // The build agent is running either way; its lead hears if its
+            // reviewer couldn't start.
+            if let Err(e) = self.start_reviewer(&agent) {
+                self.record(
+                    &agent.name,
+                    "reviewer_failed",
+                    json!({ "error": e.to_string() }),
+                );
+                if let Some(lead) = self.lead_of(&agent.group_name) {
+                    let _ = self.store.send(
+                        "drovr",
+                        &lead.name,
+                        &format!("{}'s reviewer didn't start: {e}", agent.name),
+                        "",
+                    );
+                }
+            }
+        }
+        Ok(agent)
+    }
+
+    /// Whether a build agent gets a reviewer: `stages.review` is on and it
+    /// works its ticket in stages.
+    fn reviewed(&self, agent: &Agent) -> bool {
+        self.cfg.stages.review
+            && agent.stage == "build"
+            && agent.role == "worker"
+            && self.staged(agent)
+    }
+
+    /// Start a build agent's reviewer, in the builder's folder, on
+    /// `stages.models.review`.
+    fn start_reviewer(&self, builder: &Agent) -> Result<Agent> {
+        let name = crate::config::reviewer_name(&builder.name);
+        let task = format!(
+            "You review `{builder}`'s work on this ticket as it builds. Read the ticket, the handoffs and the blueprint in the plans folder now so you know what it's building, then end your turn: `{builder}` messages you when it has something for you to review.\n\n`{builder}`'s task:\n\n{task}",
+            builder = builder.name,
+            task = builder.task,
+        );
+        self.start_agent(NewAgent {
+            name,
+            group: builder.group_name.clone(),
+            role: "worker".into(),
+            backend: builder.backend.clone(),
+            harness: builder.harness.clone(),
+            cwd: builder.cwd.clone(),
+            ticket: builder.ticket.clone(),
+            task,
+            stage: crate::config::REVIEW.into(),
+            ..NewAgent::default()
+        })
+    }
+
+    /// Start a reviewer for a PR that's waiting in the PRs view, and mark
+    /// it dispatched. The row stays `new` if the reviewer can't start.
+    pub fn dispatch_pr(&self, key: &str) -> Result<Agent> {
+        let row = self
+            .store
+            .review_pr(key)?
+            .ok_or_else(|| anyhow!("no PR {key} to review"))?;
+        let what = format!("{}/{}#{}", row.owner, row.repo, row.number);
+        // Claim the row first, so two dispatches never start two reviewers.
+        // `dispatched` with no agent yet means the reviewer is starting.
+        if self
+            .store
+            .set_review_pr_status_if(key, &["new"], "dispatched", None)?
+            == 0
+        {
+            bail!("{what} was already dispatched or dismissed");
+        }
+        let agent = match self.dispatch_review(&row.url) {
+            Ok(agent) => agent,
+            Err(e) => {
+                let _ = self
+                    .store
+                    .set_review_pr_status_if(key, &["dispatched"], "new", None);
+                return Err(e);
+            }
+        };
+        let named = self.store.set_review_pr_status_if(
+            key,
+            &["dispatched"],
+            "dispatched",
+            Some(&agent.name),
+        );
+        if !matches!(named, Ok(1)) {
+            // Dismissed while it started: nothing is left running.
+            let _ = self.remove(&agent.name);
+            bail!("{what} was dismissed while its reviewer started");
+        }
+        Ok(agent)
+    }
+
+    /// Hide a PR from the PRs view. Its reviewer, if it has one, is removed.
+    pub fn dismiss_pr(&self, key: &str) -> Result<()> {
+        let row = self
+            .store
+            .review_pr(key)?
+            .ok_or_else(|| anyhow!("no PR {key} to dismiss"))?;
+        if !row.agent.is_empty() && self.store.agent(&row.agent)?.is_some() {
+            self.remove(&row.agent)?;
+        }
+        self.store.set_review_pr_status(key, "dismissed", None)
+    }
+
+    /// `dispatch_review` for a link you typed: the PR is tracked as dispatched too.
+    pub fn review_url(&self, url: &str) -> Result<Agent> {
+        let agent = self.dispatch_review(url)?;
+        let key = crate::pr_review::key(url);
+        if self.store.review_pr(&key)?.is_none() {
+            let (owner, repo, number) = crate::pr_review::parse(url).unwrap_or_default();
+            self.store.upsert_review_pr(&crate::store::ReviewPr {
+                key: key.clone(),
+                url: crate::pr_review::canonical(url).unwrap_or_else(|| url.to_string()),
+                owner,
+                repo,
+                number: number as i64,
+                source: crate::pr_review::BY_HAND.into(),
+                status: "new".into(),
+                offered_ts: crate::store::now(),
+                ..Default::default()
+            })?;
+        }
+        self.store
+            .set_review_pr_status(&key, "dispatched", Some(&agent.name))?;
+        Ok(agent)
+    }
+
+    /// Start a reviewer for a PR: a solo agent in its own worktree at the
+    /// PR's head commit, in the local clone (cloned first if it's missing).
+    pub fn dispatch_review(&self, url: &str) -> Result<Agent> {
+        static DISPATCH: Mutex<()> = Mutex::new(());
+        let (owner, repo, number) = crate::pr_review::parse(url).ok_or_else(|| {
+            anyhow!("{url} isn't a GitHub PR link like https://github.com/o/r/pull/1")
+        })?;
+        let url = &format!("https://github.com/{owner}/{repo}/pull/{number}");
+        for part in [&owner, &repo] {
+            let plain = part
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+            if part.is_empty() || !plain || part.starts_with(['-', '.']) {
+                bail!("{url} has an owner or repo name drovr won't use as a folder");
+            }
+        }
+        if !self.cfg.review.allows(&owner) {
+            bail!("{owner} isn't in review.owners, so drovr won't review {url}");
+        }
+        let _one = DISPATCH.lock().unwrap_or_else(|e| e.into_inner());
+        let repos = match self.cfg.review.repos_dir.trim() {
+            "" => PathBuf::from(self.cfg.default_cwd()),
+            dir => PathBuf::from(expand_tilde(dir)),
+        };
+        let clone = repos.join(&repo);
+        if !clone.is_dir() {
+            std::fs::create_dir_all(&repos)?;
+            let cmd = format!(
+                "{} repo clone {} {}",
+                quote(&self.cfg.watch.gh),
+                quote(&format!("{owner}/{repo}")),
+                quote(&clone.display().to_string())
+            );
+            shell::sh(&cmd, None, None, Duration::from_secs(300))?.into_stdout("gh repo clone")?;
+        }
+        let remote = pr_remote(&clone, &owner, &repo)?;
+        // `review-<repo>-<n>`, with room left for a `-NN` suffix.
+        let digits = number.to_string();
+        let room = 40 - "review-".len() - 1 - digits.len() - 3;
+        let stem: String = slug(&repo).chars().take(room).collect();
+        let base = format!("review-{}-{digits}", stem.trim_end_matches(['-', '_']));
+        // Reserve `<home>/worktrees/<name>` by creating it: whoever creates
+        // it owns the name, even against another drovr process.
+        let worktrees = home().join("worktrees");
+        std::fs::create_dir_all(&worktrees)?;
+        let mut name = String::new();
+        for i in 1..1000 {
+            let n = if i == 1 {
+                base.clone()
+            } else {
+                format!("{base}-{i}")
+            };
+            if self.store.agent(&n)?.is_some() {
+                continue;
+            }
+            match std::fs::create_dir(worktrees.join(&n)) {
+                Ok(()) => {
+                    name = n;
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        if name.is_empty() {
+            bail!("couldn't find a free name for {base}");
+        }
+        let cwd = worktrees.join(&name);
+        let tidy = |clone: &Path| {
+            let _ = git_in(
+                clone,
+                &format!(
+                    "worktree remove --force {}",
+                    quote(&cwd.join("pr").display().to_string())
+                ),
+            );
+            let _ = git_in(
+                clone,
+                &format!("branch -D {}", quote(&format!("drovr/{name}"))),
+            );
+            let _ = git_in(clone, "worktree prune");
+            let _ = std::fs::remove_dir_all(&cwd);
+        };
+        if let Err(e) = self.make_pr_worktree(&clone, &remote, &name, number) {
+            tidy(&clone);
+            return Err(e);
+        }
+        let started = self.start_agent(NewAgent {
+            name: name.clone(),
+            role: "pr-reviewer".into(),
+            cwd: cwd.display().to_string(),
+            ticket: url.to_string(),
+            task: prompts::pr_review_task(url, &self.cfg.stages.review_skill),
+            model: self.cfg.stages.model(crate::config::REVIEW).to_string(),
+            ..NewAgent::default()
+        });
+        if started.is_err() {
+            tidy(&clone);
+        }
+        started
+    }
+
+    /// The PR's head commit, fetched from `remote`, as a worktree at
+    /// `<home>/worktrees/<name>/pr` on branch `drovr/<name>`. The agent runs
+    /// in the folder around it, so the PR's own agent config never loads.
+    fn make_pr_worktree(&self, clone: &Path, remote: &str, name: &str, number: u64) -> Result<()> {
+        let dir = home().join("worktrees").join(name).join("pr");
+        let tmp = format!("refs/drovr/pr/{name}-{}", std::process::id());
+        git_in(
+            clone,
+            &format!(
+                "fetch --quiet {} {}",
+                quote(remote),
+                quote(&format!("+pull/{number}/head:{tmp}"))
+            ),
+        )?
+        .into_stdout("git fetch the PR")?;
+        let _ = git_in(clone, "worktree prune");
+        let added = git_in(
+            clone,
+            &format!(
+                "worktree add {} -b {} {}",
+                quote(&dir.display().to_string()),
+                quote(&format!("drovr/{name}")),
+                quote(&tmp)
+            ),
+        )
+        .and_then(|o| o.into_stdout("git worktree add"));
+        let _ = git_in(clone, &format!("update-ref -d {}", quote(&tmp)));
+        added.map(|_| ())
+    }
+
+    /// Stop a build agent's reviewer, if it has one that's still going.
+    pub(crate) fn stop_reviewer(&self, builder: &str) {
+        let name = crate::config::reviewer_name(builder);
+        if let Ok(Some(r)) = self.store.agent(&name) {
+            if r.stage == crate::config::REVIEW
+                && r.run_state != "stopped"
+                && self.stop(&name).is_ok()
+            {
+                self.record(&name, "stopped", json!({ "by": builder }));
+            }
+        }
     }
 
     /// The start of a task whose agent creates its own Jira ticket first.
@@ -797,16 +1238,17 @@ impl Engine {
     /// Whether the next run starts the agent's session, continues it, or
     /// continues a copy of an adopted one.
     fn session(&self, agent: &Agent) -> Session {
-        if !harness::of(agent).picks_session_id() {
-            return if agent.session_id.is_empty() {
-                Session::New
-            } else {
-                Session::Resume
-            };
-        }
         match self.resume_mode(&agent.name).as_deref() {
             Some("fork") => Session::Fork,
             Some(_) => Session::Resume,
+            // Codex and OpenCode name the session when the first run starts.
+            None if !harness::of(agent).picks_session_id() => {
+                if agent.session_id.is_empty() {
+                    Session::New
+                } else {
+                    Session::Resume
+                }
+            }
             None if self.session_logged(&agent.name) => Session::Resume,
             None => Session::New,
         }
@@ -834,6 +1276,7 @@ impl Engine {
             cli: self.cli.clone(),
             home: home(),
             mcp_config: self.mcp_config(&agent.name)?,
+            dir: self.agent_dir(&agent.name),
             system_prompt: self.system_prompt_file(agent)?,
             settings_file: self.agent_dir(&agent.name).join("herdr-settings.json"),
             session,
@@ -854,7 +1297,9 @@ impl Engine {
         } else {
             self.session(agent)
         };
-        let args = harness.headless_args(&self.run_for(agent, session)?)?;
+        let start = self.run_for(agent, session)?;
+        let args = harness.headless_args(&start)?;
+        let env = harness.headless_env(&start)?;
         self.record(
             &agent.name,
             "run_start",
@@ -886,6 +1331,7 @@ impl Engine {
             .env("DROVR_AGENT", &agent.name)
             .env("DROVR_HOME", home())
             .envs(crate::datadog::env(&self.cfg))
+            .envs(env)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -916,18 +1362,19 @@ impl Engine {
         if let Some(log) = &log {
             let harness = harness::of(&agent);
             let mut session = None;
+            let mut state = Value::Null;
             for v in log
                 .lines()
                 .filter_map(|l| serde_json::from_str::<Value>(l).ok())
             {
-                match harness.parse(&v) {
+                match harness.parse(&v, &mut state) {
                     Event::Session(id) if session.is_none() => session = Some(id),
                     Event::End(e) => end = Some(e),
                     _ => {}
                 }
             }
-            // A forked session gets a new ID, and Codex names its session
-            // when the first run starts: keep following it.
+            // A forked session gets a new ID, and Codex and OpenCode name
+            // their sessions when the first run starts: keep following it.
             let fork = self.resume_mode(name).as_deref() == Some("fork");
             if fork || !harness.picks_session_id() {
                 if let Some(id) = session.filter(|id| !id.is_empty() && *id != agent.session_id) {
@@ -952,21 +1399,38 @@ impl Engine {
             _ => "idle",
         };
         self.store.set_agent(name, "run_state", next)?;
-        let end = end.unwrap_or_default();
-        self.record(
-            name,
-            "run_end",
-            json!({
-                "run": agent.runs,
-                "state": next,
-                "exit": exit,
-                "cost_usd": (total - agent.cost_usd).max(0.0),
-                "duration_ms": end["duration_ms"],
-                "turns": end["num_turns"],
-                "tokens": end["tokens"],
-                "models": end["models"],
-            }),
-        );
+        let priced = end.as_ref().is_some_and(|e| {
+            harness::of(&agent)
+                .run_cost(e, &mut Costs::default())
+                .is_some()
+        });
+        let mut end = end.unwrap_or_default();
+        // A CLI that reports each run's own cost (OpenCode) leaves the
+        // session's running total to drovr: the stage checkpoint reads it.
+        if end["total_cost_usd"].is_null() && end["cost_usd"].is_number() {
+            if let Some(session) = end["session_id"].as_str().filter(|s| !s.is_empty()) {
+                let total: f64 = self
+                    .run_costs(&self.agent(name)?)
+                    .into_iter()
+                    .filter(|(s, _)| s == session)
+                    .map(|(_, cost)| cost)
+                    .sum();
+                end["total_cost_usd"] = json!(total);
+            }
+        }
+        let event = json!({
+            "run": agent.runs,
+            "state": next,
+            "exit": exit,
+            "cost_usd": (total - agent.cost_usd).max(0.0),
+            "duration_ms": end["duration_ms"],
+            "turns": end["num_turns"],
+            "tokens": end["tokens"],
+            "models": end["models"],
+            "model_costs": self.last_model_costs(&agent),
+        });
+        self.log_spend(&agent, agent.runs, priced, &event);
+        self.record(name, "run_end", event);
         // A stage agent may be asked for a checkpoint, or continued fresh.
         if (next == "idle" || next == "done")
             && self.after_stage_run(&agent, &end, log.as_deref().unwrap_or(""))?
@@ -1143,6 +1607,7 @@ impl Engine {
     pub fn stop_by_you(&self, name: &str) -> Result<()> {
         self.stop(name)?;
         self.record(name, "stopped", json!({ "by": "you" }));
+        self.stop_reviewer(name);
         Ok(())
     }
 
@@ -1229,10 +1694,15 @@ impl Engine {
         let agent = self.store.agent(name)?;
         self.record(name, "agent_removed", json!({}));
         let _ = self.stop(name);
+        // Its reviewer works in its folder, which may be about to go.
+        self.stop_reviewer(name);
         self.store.remove_agent(name)?;
         let _ = std::fs::remove_dir_all(home().join("agents").join(name));
         let worktree = home().join("worktrees").join(name);
         match agent {
+            Some(a) if a.role == "pr-reviewer" && Path::new(&a.cwd) == worktree => {
+                Ok(remove_pr_worktree(&worktree, name))
+            }
             Some(a) if Path::new(&a.cwd) == worktree => Ok(remove_worktree(&worktree, name)),
             _ => Ok(String::new()),
         }
@@ -1503,8 +1973,9 @@ Plan the work, spawn workers with spawn_worker (or coordinate the agents already
     }
 
     /// Add an event to a ticket's record from outside any agent (the
-    /// watcher), in every folder its agents and groups record to. A ticket
-    /// nobody has picked up has no record.
+    /// watcher), in every folder its agents and groups record to, or once
+    /// they're gone, the folder written to last. A ticket nobody has picked
+    /// up has no record.
     pub fn record_ticket(&self, key: &str, kind: &str, data: Value) {
         if !self.cfg.workflow.enabled {
             return;
@@ -1528,6 +1999,9 @@ Plan the work, spawn workers with spawn_worker (or coordinate the agents already
             if ledger::tickets_in(&a.ticket).contains(&key) {
                 folders.insert(folder_of(&a.group_name));
             }
+        }
+        if folders.is_empty() {
+            folders.extend(ledger::latest_folder(&self.cfg, &key));
         }
         let mut event = json!({ "source": "watcher" });
         if let (Some(e), Value::Object(fields)) = (event.as_object_mut(), data) {
@@ -1611,12 +2085,17 @@ Plan the work, spawn workers with spawn_worker (or coordinate the agents already
             bail!("name is required");
         }
         let group = lead.group_name.clone();
-        // Stage agents that finished (stopped) don't count against the limit.
+        // Stage agents that finished (stopped) don't count against the
+        // limit, and nor do reviewers, which come with their builders.
         let workers = self
             .store
             .agents(Some(&group))?
             .into_iter()
-            .filter(|a| a.role == "worker" && !(!a.stage.is_empty() && a.run_state == "stopped"))
+            .filter(|a| {
+                a.role == "worker"
+                    && a.stage != crate::config::REVIEW
+                    && !(!a.stage.is_empty() && a.run_state == "stopped")
+            })
             .count();
         if workers >= self.cfg.orchestrator.max_workers {
             bail!(
@@ -1683,7 +2162,7 @@ Plan the work, spawn workers with spawn_worker (or coordinate the agents already
                     .store
                     .agents(Some(&spec.group))?
                     .iter()
-                    .filter(|a| a.role == "worker")
+                    .filter(|a| a.role == "worker" && a.stage != crate::config::REVIEW)
                     .count();
                 let max = self.cfg.orchestrator.max_workers;
                 if workers >= max {
@@ -1733,6 +2212,21 @@ Plan the work, spawn workers with spawn_worker (or coordinate the agents already
                         json!({ "reason": item.payload["trigger"], "ticket": item.payload["ticket"], "by": "you" }),
                     );
                     self.prompt(agent, text)?;
+                }
+            }
+            // A PR to review: "Dispatch reviewer" starts one, anything else
+            // dismisses it. If the reviewer can't start, the item stays.
+            "review" => {
+                if answer == "Dispatch reviewer" {
+                    let url = item.payload["url"].as_str().unwrap_or("");
+                    let agent = self.dispatch_review(url)?;
+                    self.store.resolve_item(
+                        id,
+                        "answered",
+                        &format!("Reviewer {} started", agent.name),
+                    )?;
+                } else {
+                    self.store.resolve_item(id, "dismissed", answer)?;
                 }
             }
             // A Jira update you approved, as you edited it: the comment's
@@ -1875,10 +2369,26 @@ Plan the work, spawn workers with spawn_worker (or coordinate the agents already
 
     // -- output ---------------------------------------------------------------
 
+    /// An agent's output. A herdr agent's is its session's record, shown
+    /// as a headless run's is, unless `pane` asks for what's on its pane's
+    /// screen (or there's no record to read yet).
+    pub fn output_view(&self, name: &str, max_lines: usize, pane: bool) -> Result<Vec<Line>> {
+        let agent = self.agent(name)?;
+        if agent.backend == "herdr" {
+            if !pane {
+                if let Some(lines) = self.herdr_native(&agent, max_lines) {
+                    return Ok(lines);
+                }
+            }
+            return self.herdr_read(&agent, max_lines);
+        }
+        self.output(name, max_lines)
+    }
+
     pub fn output(&self, name: &str, max_lines: usize) -> Result<Vec<Line>> {
         let agent = self.agent(name)?;
         if agent.backend == "herdr" {
-            return self.herdr_read(&agent, max_lines);
+            return self.output_view(name, max_lines, false);
         }
         let dir = self.agent_dir(name).join("runs");
         let harness = harness::of(&agent);
@@ -2092,14 +2602,35 @@ Plan the work, spawn workers with spawn_worker (or coordinate the agents already
         session: Session,
         first: Option<&str>,
     ) -> Result<()> {
-        let args = harness::of(agent).herdr_args(&self.run_for(agent, session)?)?;
+        let harness = harness::of(agent);
+        let start_run = self.run_for(agent, session)?;
+        let args = harness.herdr_args(&start_run)?;
+        let env = harness.herdr_env(&start_run)?;
         let pane = self.herdr_agent_pane(agent)?;
         self.store.set_agent(&agent.name, "pane", &pane)?;
+        let mut state = self.herdr_load_run(&agent.name);
+        state.opened = crate::store::now();
+        self.herdr_save_run(&agent.name, &state)?;
+        // herdr starts the agent from the pane's shell, so what it needs
+        // from the environment is exported there first.
+        if !env.is_empty() {
+            let line = env
+                .iter()
+                .map(|(k, v)| format!("{k}={}", quote(v)))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let export = self.herdr_fill(
+                &self.cfg.herdr.run,
+                &[("pane", &pane), ("cmd", &format!("export {line}"))],
+            );
+            self.herdr_start_when_ready(&agent.name, &export, &pane, HERDR_READY_WAIT)?;
+        }
         let args: Vec<String> = args.iter().map(|a| quote(a)).collect();
         let start = self.herdr_fill(
-            &self.cfg.herdr.start,
+            &herdr_start_template(&self.cfg.herdr.start),
             &[
                 ("name", &herdr_name(&agent.name)),
+                ("kind", harness.herdr_kind()),
                 ("pane", &pane),
                 ("args", &args.join(" ")),
             ],
@@ -2140,10 +2671,17 @@ Plan the work, spawn workers with spawn_worker (or coordinate the agents already
     fn herdr_track_cost(&self, name: &str) -> Result<(HerdrRun, Option<harness::Live>)> {
         let agent = self.agent(name)?;
         let mut run = self.herdr_load_run(name);
+        let harness = harness::of(&agent);
+        // Claude Code's status line reports it; OpenCode's database has it.
         let live = std::fs::read_to_string(self.agent_dir(name).join("status-line.json"))
             .ok()
             .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-            .and_then(|v| harness::of(&agent).live_status(&v));
+            .and_then(|v| harness.live_status(&v))
+            .or_else(|| {
+                (!agent.session_id.is_empty())
+                    .then(|| harness.session_live(&self.cfg, &agent.session_id))
+                    .flatten()
+            });
         if let Some(live) = &live {
             // A lower total means a new count (a new or forked session).
             let added = if live.session == run.session && live.total_cost_usd >= run.total {
@@ -2190,20 +2728,19 @@ Plan the work, spawn workers with spawn_worker (or coordinate the agents already
     fn herdr_end_run(&self, agent: &Agent, state: &str) -> Result<Value> {
         let (mut run, live) = self.herdr_track_cost(&agent.name)?;
         let model = live.as_ref().map(|l| l.model.clone());
-        self.record(
-            &agent.name,
-            "run_end",
-            json!({
-                "run": self.agent(&agent.name)?.runs,
-                "state": state,
-                "exit": null,
-                "cost_usd": run.run_cost,
-                "duration_ms": ((crate::store::now() - run.started) * 1000.0) as i64,
-                "turns": null,
-                "tokens": null,
-                "models": model.filter(|m| !m.is_empty()).map(|m| vec![m]),
-            }),
-        );
+        let n = self.agent(&agent.name)?.runs;
+        let event = json!({
+            "run": n,
+            "state": state,
+            "exit": null,
+            "cost_usd": run.run_cost,
+            "duration_ms": ((crate::store::now() - run.started) * 1000.0) as i64,
+            "turns": null,
+            "tokens": null,
+            "models": model.filter(|m| !m.is_empty()).map(|m| vec![m]),
+        });
+        self.log_spend(agent, n, live.is_some(), &event);
+        self.record(&agent.name, "run_end", event);
         run.run_cost = 0.0;
         self.herdr_save_run(&agent.name, &run)?;
         Ok(json!({
@@ -2276,6 +2813,54 @@ Plan the work, spawn workers with spawn_worker (or coordinate the agents already
         Ok(())
     }
 
+    /// A herdr agent's session, read from the CLI's own record of it, with
+    /// a last line when it's waiting for you in its pane. None when there's
+    /// no record to read.
+    fn herdr_native(&self, agent: &Agent, max_lines: usize) -> Option<Vec<Line>> {
+        if agent.session_id.is_empty() {
+            return None;
+        }
+        let harness = harness::of(agent);
+        let parse = |v: &Value, run: &mut Value| harness.parse_transcript(v, run);
+        let items = match harness.transcript(&self.cfg, &agent.session_id)? {
+            Transcript::File(path) => rendered_log_by(&path, &parse),
+            Transcript::Events(events) => {
+                let mut run = Value::Null;
+                let mut items = vec![];
+                for v in &events {
+                    match parse(v, &mut run) {
+                        Event::Lines(lines) => items.extend(lines.into_iter().map(Rendered::Line)),
+                        Event::End(end) => items.push(Rendered::Result(end)),
+                        Event::Session(_) | Event::Skip => {}
+                    }
+                }
+                Arc::new(items)
+            }
+        };
+        let prompts = self.agent_dir(&agent.name).join("prompts");
+        let mut costs = Costs::default();
+        let mut lines: Vec<Line> = items
+            .iter()
+            .map(|item| match item {
+                Rendered::Line(l) if l.kind == "prompt" => Line {
+                    kind: l.kind.clone(),
+                    text: prompt_from_file(&l.text, &prompts).unwrap_or_else(|| l.text.clone()),
+                },
+                Rendered::Line(l) => l.clone(),
+                Rendered::Result(v) => result_line(v, harness, &mut costs),
+            })
+            .collect();
+        if self.herdr_load_run(&agent.name).status == "blocked" {
+            lines.push(Line {
+                kind: "waiting".into(),
+                text: "Waiting for you in its herdr pane: a permission prompt or a question."
+                    .into(),
+            });
+        }
+        let skip = lines.len().saturating_sub(max_lines);
+        Some(lines.split_off(skip))
+    }
+
     fn herdr_read(&self, agent: &Agent, max_lines: usize) -> Result<Vec<Line>> {
         if agent.pane.is_empty() {
             return Ok(vec![]);
@@ -2300,6 +2885,34 @@ Plan the work, spawn workers with spawn_worker (or coordinate the agents already
             .collect())
     }
 
+    /// For a CLI that names its own sessions (OpenCode), keep the session
+    /// a herdr agent is in: the one herdr's integration reports, else, once
+    /// a run ends and drovr doesn't know it yet (or the start forked one),
+    /// the newest started in its folder since its pane opened.
+    fn herdr_learn_session(&self, agent: &Agent, get: &str, ended: bool) -> Result<()> {
+        let harness = harness::of(agent);
+        if harness.picks_session_id() {
+            return Ok(());
+        }
+        let fork = self.resume_mode(&agent.name).as_deref() == Some("fork");
+        let id = herdr_session(get).or_else(|| {
+            (ended && (agent.session_id.is_empty() || fork))
+                .then(|| {
+                    let opened = self.herdr_load_run(&agent.name).opened;
+                    harness.latest_session(&self.cfg, &agent.cwd, opened)
+                })
+                .flatten()
+        });
+        if let Some(id) = id.filter(|id| *id != agent.session_id) {
+            self.store.set_agent(&agent.name, "session_id", &id)?;
+            if fork {
+                std::fs::write(self.agent_dir(&agent.name).join("resumed"), "same")?;
+            }
+            self.record(&agent.name, "session", json!({ "session": id }));
+        }
+        Ok(())
+    }
+
     /// Map herdr's view of agent states (working/blocked/done/idle) onto ours.
     pub fn refresh_herdr(&self) -> Result<()> {
         for agent in self.store.agents(None)? {
@@ -2318,7 +2931,15 @@ Plan the work, spawn workers with spawn_worker (or coordinate the agents already
                 self.store.set_agent(&agent.name, "run_state", "stopped")?;
                 continue;
             }
-            let (run, _) = self.herdr_track_cost(&agent.name)?;
+            let ended = agent.run_state == "working"
+                && matches!(herdr_status(&out.stdout).as_deref(), Some("idle" | "done"));
+            self.herdr_learn_session(&agent, &out.stdout, ended)?;
+            let (mut run, _) = self.herdr_track_cost(&agent.name)?;
+            let status = herdr_status(&out.stdout).unwrap_or_default();
+            if run.status != status {
+                run.status = status;
+                self.herdr_save_run(&agent.name, &run)?;
+            }
             let state = match herdr_status(&out.stdout).as_deref() {
                 Some("working") | Some("blocked") => "working",
                 Some("idle") | Some("done") => {
@@ -2386,6 +3007,43 @@ fn herdr_status(stdout: &str) -> Option<String> {
         .as_str()
         .map(String::from)
         .or_else(|| find_key(&v, &["agent_status", "state", "status"]))
+}
+
+/// What a long prompt sent to a herdr pane said: `herdr_prompt` sends
+/// `[drovr] Read <file> and act on it.` for a file in the agent's prompts
+/// folder.
+fn prompt_from_file(text: &str, prompts: &Path) -> Option<String> {
+    let file = text
+        .strip_prefix("[drovr] Read ")?
+        .strip_suffix(" and act on it.")?;
+    let file = Path::new(file);
+    if file.parent()? != prompts {
+        return None;
+    }
+    std::fs::read_to_string(file).ok()
+}
+
+/// The session herdr's integration reports for an agent in `herdr agent
+/// get` output: `agent_session: {"agent": "opencode", "kind": "id",
+/// "value": "ses_…"}`.
+fn herdr_session(stdout: &str) -> Option<String> {
+    let v: Value = serde_json::from_str(stdout).ok()?;
+    let s = &v["result"]["agent"]["agent_session"];
+    (s["kind"] == "id")
+        .then(|| s["value"].as_str())
+        .flatten()
+        .filter(|id| !id.is_empty())
+        .map(String::from)
+}
+
+/// The `herdr.start` template with the agent's kind as `{kind}`. A config
+/// written before OpenCode ran in herdr says `--kind claude`.
+fn herdr_start_template(template: &str) -> String {
+    if template.contains("{kind}") {
+        template.to_string()
+    } else {
+        template.replace("--kind claude", "--kind {kind}")
+    }
 }
 
 /// herdr agent names: `[a-z][a-z0-9_-]{0,31}`.
@@ -2458,6 +3116,18 @@ fn result_line(v: &Value, harness: &dyn Harness, costs: &mut Costs) -> Line {
     }
 }
 
+/// How a run ended (its last `Event::End`), from its whole log.
+fn run_end(log: &str, harness: &dyn Harness) -> Option<Value> {
+    let mut state = Value::Null;
+    log.lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter_map(|v| match harness.parse(&v, &mut state) {
+            Event::End(end) => Some(end),
+            _ => None,
+        })
+        .last()
+}
+
 /// One event of a run log, ready to show. The end of a run keeps what its
 /// line needs, since its cost is worked out when the output is put together.
 #[derive(Clone)]
@@ -2474,6 +3144,8 @@ struct RunLog {
     ino: u64,
     parsed_to: u64,
     items: Arc<Vec<Rendered>>,
+    /// What the harness kept from the lines parsed so far.
+    state: Value,
 }
 
 /// Run logs already parsed in this process. The app asks for an agent's
@@ -2486,6 +3158,12 @@ fn run_logs() -> &'static Mutex<HashMap<PathBuf, RunLog>> {
 
 /// A run log's events, parsing only what was added since the last call.
 fn rendered_log(path: &Path, harness: &dyn Harness) -> Arc<Vec<Rendered>> {
+    rendered_log_by(path, &|v, run| harness.parse(v, run))
+}
+
+/// A log of JSON lines read with `parse`, parsing only what was added
+/// since the last call: a run log, or an interactive session's transcript.
+fn rendered_log_by(path: &Path, parse: &dyn Fn(&Value, &mut Value) -> Event) -> Arc<Vec<Rendered>> {
     use std::io::{Read, Seek, SeekFrom};
     use std::os::unix::fs::MetadataExt;
     let Ok(meta) = std::fs::metadata(path) else {
@@ -2499,6 +3177,7 @@ fn rendered_log(path: &Path, harness: &dyn Harness) -> Arc<Vec<Rendered>> {
         ino: meta.ino(),
         parsed_to: 0,
         items: Arc::default(),
+        state: Value::Null,
     };
     let log = logs.entry(path.to_path_buf()).or_insert_with(fresh);
     if log.ino != meta.ino() || meta.len() < log.parsed_to {
@@ -2522,7 +3201,7 @@ fn rendered_log(path: &Path, harness: &dyn Harness) -> Arc<Vec<Rendered>> {
             let Ok(v) = serde_json::from_str::<Value>(line) else {
                 continue;
             };
-            match harness.parse(&v) {
+            match parse(&v, &mut log.state) {
                 Event::Lines(lines) => items.extend(lines.into_iter().map(Rendered::Line)),
                 Event::End(end) => items.push(Rendered::Result(end)),
                 Event::Session(_) | Event::Skip => {}
@@ -2536,6 +3215,159 @@ fn rendered_log(path: &Path, harness: &dyn Harness) -> Arc<Vec<Rendered>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An engine with a group (lead and worker) and a solo agent, its
+    /// standing instructions set to `files`.
+    fn instructions_engine(case: &str, files: &[String]) -> (PathBuf, Engine) {
+        let dir = std::env::temp_dir().join(format!("drovr-instr-{}-{case}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cfg = Config::default();
+        cfg.defaults.auto_wake = false;
+        cfg.defaults.instructions = files.to_vec();
+        let engine = Engine::with(
+            Store::open(&dir.join("t.db")).unwrap(),
+            cfg,
+            PathBuf::from("drovr"),
+        );
+        engine
+            .store
+            .add_group("ig", "", "", "/tmp", "", true)
+            .unwrap();
+        for (name, group, role) in [
+            (format!("{case}-lead"), "ig", "orchestrator"),
+            (format!("{case}-api"), "ig", "worker"),
+            (format!("{case}-solo"), "", "solo"),
+        ] {
+            engine
+                .store
+                .add_agent(&Agent {
+                    name,
+                    group_name: group.into(),
+                    role: role.into(),
+                    ..Agent::default()
+                })
+                .unwrap();
+        }
+        (dir, engine)
+    }
+
+    fn prompt_of(engine: &Engine, name: &str) -> String {
+        let agent = engine.agent(name).unwrap();
+        let path = engine.system_prompt_file(&agent).unwrap();
+        std::fs::read_to_string(path).unwrap()
+    }
+
+    #[test]
+    fn standing_instructions_reach_every_agent() {
+        let dir = std::env::temp_dir().join(format!("drovr-instr-files-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("skills/drovr-sre-standing-rules")).unwrap();
+        let a = dir.join("a.md");
+        std::fs::write(&a, "Use pnpm.").unwrap();
+        let skill = dir.join("skills/drovr-sre-standing-rules/SKILL.md");
+        std::fs::write(
+            &skill,
+            "---\nname: rules\ndescription: d\n---\n\nNo cd prefixes.\n",
+        )
+        .unwrap();
+        let files = [a.display().to_string(), skill.display().to_string()];
+        let (_d, engine) = instructions_engine("all", &files);
+        for name in ["all-lead", "all-api", "all-solo"] {
+            let p = prompt_of(&engine, name);
+            for want in [
+                "## Standing instructions",
+                "### a.md",
+                "Use pnpm.",
+                "### drovr-sre-standing-rules",
+                "No cd prefixes.",
+            ] {
+                assert!(p.contains(want), "{name}: {want}\n{p}");
+            }
+            assert!(!p.contains("description:"), "{name}\n{p}");
+            assert!(
+                p.find("## Standing instructions").unwrap()
+                    > p.find("You are the drovr agent").unwrap(),
+                "{name}\n{p}"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_instruction_file_is_reported() {
+        let (_d, engine) = instructions_engine("missing", &["/nonexistent/rules.md".into()]);
+        let p = prompt_of(&engine, "missing-solo");
+        assert!(
+            p.contains("drovr couldn't read /nonexistent/rules.md"),
+            "{p}"
+        );
+        assert!(p.contains("### rules.md"), "{p}");
+    }
+
+    #[test]
+    fn tilde_instruction_paths_are_expanded() {
+        let (_d, engine) = instructions_engine("tilde", &["~/drovr-nonexistent-xyz.md".into()]);
+        let p = prompt_of(&engine, "tilde-solo");
+        let want = crate::config::expand_tilde("~/drovr-nonexistent-xyz.md");
+        assert!(p.contains(&format!("couldn't read {want}")), "{p}");
+        assert!(!p.contains("couldn't read ~/"), "{p}");
+    }
+
+    #[test]
+    fn instruction_contents_are_not_personalized() {
+        let dir = std::env::temp_dir().join(format!("drovr-instr-pers-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("rules.md");
+        std::fs::write(&f, "ask the human first").unwrap();
+        let (_d, mut engine) = instructions_engine("pers", &[f.display().to_string()]);
+        engine.cfg.defaults.your_name = "Izz".into();
+        let p = prompt_of(&engine, "pers-solo");
+        assert!(p.contains("ask the human first"), "{p}");
+        assert!(p.contains("Izz wants these followed"), "{p}");
+    }
+
+    #[test]
+    fn instructions_are_capped_in_total() {
+        let dir = std::env::temp_dir().join(format!("drovr-instr-cap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let files: Vec<String> = ["one", "two", "three"]
+            .iter()
+            .map(|n| {
+                let f = dir.join(format!("{n}.md"));
+                std::fs::write(&f, "x".repeat(25_000)).unwrap();
+                f.display().to_string()
+            })
+            .collect();
+        let (_d, engine) = instructions_engine("cap", &files);
+        let p = prompt_of(&engine, "cap-solo");
+        assert!(p.contains("### one.md") && p.contains("### two.md"), "{p}");
+        assert!(!p.contains("### three.md"));
+        assert!(p.contains(
+            "- drovr left out the rest: standing instructions are capped at 60,000 characters."
+        ));
+    }
+
+    #[test]
+    fn no_instructions_no_section() {
+        let (_d, engine) = instructions_engine("none", &[]);
+        assert!(!prompt_of(&engine, "none-solo").contains("Standing instructions"));
+    }
+
+    #[test]
+    fn edited_instructions_apply_next_run() {
+        let dir = std::env::temp_dir().join(format!("drovr-instr-edit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("rules.md");
+        std::fs::write(&f, "v1").unwrap();
+        let (_d, engine) = instructions_engine("edit", &[f.display().to_string()]);
+        assert!(prompt_of(&engine, "edit-solo").contains("v1"));
+        std::fs::write(&f, "v2").unwrap();
+        let p = prompt_of(&engine, "edit-solo");
+        assert!(p.contains("v2") && !p.contains("v1"), "{p}");
+    }
 
     #[test]
     fn an_agent_runs_on_its_model_then_its_stages_then_the_default() {
@@ -2994,6 +3826,31 @@ mod tests {
         let out = r#"{"id":"cli:agent:get","result":{"agent":{"agent":"claude","agent_session":{"agent":"claude","kind":"id","source":"herdr:claude","value":"225e9ac0-9c9c-4f7c-927e-49054bff82a0"},"agent_status":"done","cwd":"/Users/x/develop","focused":false,"pane_id":"w7:p1","revision":32,"state_change_seq":1578,"tab_id":"w7:t1","terminal_id":"term_65e3465ece130d","terminal_title":"✳ pay-api coordinator session restart","workspace_id":"w7"},"type":"agent_info"}}"#;
         assert_eq!(herdr_status(out).as_deref(), Some("done"));
         assert_eq!(herdr_status("not json"), None);
+        assert_eq!(
+            herdr_session(out).as_deref(),
+            Some("225e9ac0-9c9c-4f7c-927e-49054bff82a0")
+        );
+        let opencode = r#"{"result":{"agent":{"agent":"opencode","agent_session":{"agent":"opencode","kind":"id","source":"herdr:opencode","value":"ses_4f2a1c"},"agent_status":"idle"}}}"#;
+        assert_eq!(herdr_session(opencode).as_deref(), Some("ses_4f2a1c"));
+        // Without herdr's integration there's no session to read.
+        assert_eq!(
+            herdr_session(r#"{"result":{"agent":{"agent_status":"idle"}}}"#),
+            None
+        );
+    }
+
+    #[test]
+    fn starts_herdr_agents_as_their_kind() {
+        let default = crate::config::Herdr::default().start;
+        assert!(default.contains("--kind {kind}"), "{default}");
+        // A config from before OpenCode ran in herdr.
+        let old = "{herdr} agent start {name} --kind claude --pane {pane} -- {args}";
+        assert_eq!(
+            herdr_start_template(old),
+            "{herdr} agent start {name} --kind {kind} --pane {pane} -- {args}"
+        );
+        let custom = "my-herdr start {name} --type {kind} -- {args}";
+        assert_eq!(herdr_start_template(custom), custom);
     }
 
     /// An engine whose `herdr` is a stub that logs each call to the returned
@@ -3022,6 +3879,99 @@ esac
         cfg.herdr.command = format!("sh {}", stub.display());
         let store = Store::open(&dir.join("t.db")).unwrap();
         (Engine::with(store, cfg, "drovr".into()), log)
+    }
+
+    #[test]
+    fn a_herdr_agent_shows_its_session_natively() {
+        use std::os::unix::fs::PermissionsExt;
+        let (mut engine, _) = engine_with_logging_herdr("native", 0, 0);
+        let name = "native-oc";
+        let prompts = engine.agent_dir(name).join("prompts");
+        std::fs::create_dir_all(&prompts).unwrap();
+        let long = prompts.join("1.md");
+        std::fs::write(&long, "A long ticket\nwith two lines").unwrap();
+        // OpenCode 2's database, which `opencode debug paths db` names.
+        let dir = long.parent().unwrap().parent().unwrap().to_path_buf();
+        let db_file = dir.join("opencode.db");
+        let _ = std::fs::remove_file(&db_file);
+        let db = rusqlite::Connection::open(&db_file).unwrap();
+        db.execute_batch(
+            r#"
+            CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+              type TEXT NOT NULL, seq INTEGER NOT NULL, time_created INTEGER NOT NULL,
+              time_updated INTEGER NOT NULL, data TEXT NOT NULL);
+            CREATE TABLE session_part (message_id TEXT NOT NULL, session_id TEXT NOT NULL,
+              ordinal INTEGER NOT NULL, type TEXT NOT NULL, call_id TEXT,
+              time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL,
+              PRIMARY KEY (message_id, ordinal));
+            INSERT INTO session_message VALUES
+              ('msg_1', 'ses_native_test', 'user', 1, 0, 0, '{"time":{"created":1000},"text":"Fix the login bug"}'),
+              ('msg_2', 'ses_native_test', 'assistant', 2, 0, 0,
+               '{"time":{"created":1100,"completed":3000},"finish":"stop","cost":0.25,
+                 "tokens":{"input":20,"output":5,"reasoning":0,"cache":{"read":0,"write":0}}}');
+            INSERT INTO session_part VALUES
+              ('msg_2', 'ses_native_test', 0, 'tool', 'c1', 0, 0,
+               '{"id":"c1","name":"shell","state":{"status":"completed","input":{"command":"ls"},
+                 "content":[{"type":"text","text":"a.rs"}]},"time":{"created":1150,"completed":1200}}'),
+              ('msg_2', 'ses_native_test', 1, 'text', NULL, 0, 0, '{"text":"Fixed."}');
+            "#,
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO session_message VALUES ('msg_3', 'ses_native_test', 'user', 3, 0, 0, ?1)",
+            [json!({ "time": { "created": 5000 }, "text": format!("[drovr] Read {} and act on it.", long.display()) }).to_string()],
+        )
+        .unwrap();
+        drop(db);
+        let stub = dir.join("opencode");
+        std::fs::write(&stub, format!("#!/bin/sh\necho {}\n", db_file.display())).unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        engine.cfg.opencode.command = stub.display().to_string();
+        engine
+            .store
+            .add_agent(&Agent {
+                name: name.into(),
+                backend: "herdr".into(),
+                harness: "opencode".into(),
+                session_id: "ses_native_test".into(),
+                cwd: "/tmp".into(),
+                ..Agent::default()
+            })
+            .unwrap();
+        engine.store.set_agent(name, "pane", "w1:p1").unwrap();
+        let shown = |engine: &Engine, pane: bool| {
+            engine
+                .output_view(name, 100, pane)
+                .unwrap()
+                .into_iter()
+                .map(|l| format!("{}: {}", l.kind, l.text))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            shown(&engine, false),
+            [
+                "prompt: Fix the login bug",
+                "tool: shell ls",
+                "result: a.rs",
+                "text: Fixed.",
+                "final: finished in 2s · $0.250 · 1 turns",
+                // A long prompt sent through a file shows what the file said.
+                "prompt: A long ticket\nwith two lines",
+            ]
+        );
+        // Waiting in its pane.
+        let mut run = engine.herdr_load_run(name);
+        run.status = "blocked".into();
+        engine.herdr_save_run(name, &run).unwrap();
+        assert_eq!(
+            shown(&engine, false).last().unwrap().split(':').next(),
+            Some("waiting")
+        );
+        // Pane: what herdr reads off the screen (the stub prints nothing).
+        assert!(shown(&engine, true).is_empty());
+        // No session yet: the pane.
+        engine.store.set_agent(name, "session_id", "").unwrap();
+        assert!(shown(&engine, false).is_empty());
     }
 
     fn add_herdr_test_agent(engine: &Engine, backend: &str, pane: &str, state: &str) -> Agent {
@@ -3543,6 +4493,10 @@ esac
         assert_eq!(ends[0]["state"], "idle");
         assert_eq!(ends[0]["cost_usd"], 0.5);
         assert_eq!(ends[0]["models"], json!(["claude-haiku-5-5"]));
+        let spent = engine.store.spend_since(0.0).unwrap();
+        assert_eq!(spent.len(), 1, "{spent:?}");
+        assert_eq!((spent[0].run, spent[0].cost_usd), (1, Some(0.5)));
+        assert_eq!(spent[0].model, "claude-haiku-5-5");
     }
 
     #[test]
@@ -3630,6 +4584,83 @@ esac
         assert!(calls.contains("pane close w1:p1"), "{calls}");
         assert!(calls.contains("--session-id"), "{calls}");
         assert!(calls.contains("agent prompt w1:p2"), "{calls}");
+    }
+
+    #[test]
+    fn a_run_end_records_what_each_model_cost() {
+        let dir = std::env::temp_dir().join(format!("drovr-model-costs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cfg = Config::default();
+        cfg.workflow.enabled = true;
+        cfg.reports.dir = dir.join("plans").display().to_string();
+        let engine = Engine::with(Store::open(&dir.join("t.db")).unwrap(), cfg, "drovr".into());
+        let name = format!("model-costs-{}", std::process::id());
+        engine
+            .store
+            .add_agent(&Agent {
+                name: name.clone(),
+                role: "solo".into(),
+                backend: "headless".into(),
+                harness: "claude".into(),
+                run_state: "idle".into(),
+                ticket: "SRE-1".into(),
+                ..Agent::default()
+            })
+            .unwrap();
+        let runs = engine.agent_dir(&name).join("runs");
+        let end = |total: f64, models: Value| {
+            json!({ "type": "result", "session_id": "s", "total_cost_usd": total, "modelUsage": models })
+                .to_string()
+        };
+        let logs = [
+            end(1.0, json!({ "claude-opus-5-5": { "costUSD": 1.0 } })),
+            end(
+                1.75,
+                json!({ "claude-haiku-5-5": { "costUSD": 0.25 }, "claude-opus-5-5": { "costUSD": 1.5 } }),
+            ),
+        ];
+        for (i, log) in logs.iter().enumerate() {
+            let run = i as i64 + 1;
+            std::fs::write(runs.join(format!("{run}.jsonl")), log).unwrap();
+            std::fs::write(runs.join(format!("{run}.exit")), "0").unwrap();
+            assert_eq!(engine.store.claim_run(&name).unwrap(), Some(run));
+            engine.finished(&name).unwrap();
+        }
+        let got: Vec<Value> = ledger::timeline(&engine.cfg, "SRE-1")
+            .into_iter()
+            .filter(|e| e["kind"] == "run_end")
+            .map(|e| e["model_costs"].clone())
+            .collect();
+        assert_eq!(
+            got,
+            [
+                json!({ "claude-opus-5-5": 1.0 }),
+                json!({ "claude-haiku-5-5": 0.25, "claude-opus-5-5": 0.5 })
+            ]
+        );
+        let spent: Vec<_> = engine
+            .store
+            .spend_since(0.0)
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.run, r.model, r.cost_usd))
+            .collect();
+        assert_eq!(
+            spent,
+            [
+                (1, "claude-opus-5-5".to_string(), Some(1.0)),
+                (2, "claude-haiku-5-5".to_string(), Some(0.25)),
+                (2, "claude-opus-5-5".to_string(), Some(0.5)),
+            ]
+        );
+        // A killed run reports no cost: it's unknown, not zero.
+        assert_eq!(engine.store.claim_run(&name).unwrap(), Some(3));
+        engine.finished(&name).unwrap();
+        let killed = engine.store.spend_since(0.0).unwrap().pop().unwrap();
+        assert_eq!((killed.run, killed.cost_usd), (3, None));
+        let _ = std::fs::remove_dir_all(engine.agent_dir(&name));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -4,13 +4,15 @@
 //! config edits apply immediately and nothing holds a lock across slow calls
 //! such as an agent querying Jira through its MCP.
 
+mod cli_install;
+mod login_path;
 mod menu;
 mod terminal;
+mod themes;
 
 use drovr_core::engine::{Dispatch, Line, NewGroup};
 use drovr_core::reports::ReportFile;
 use drovr_core::review::{self, Repo};
-use drovr_core::shell::quote;
 use drovr_core::sources::{Page, SlackMessage, Sources, Ticket};
 use drovr_core::store::{Agent, Group, Item, Message, Note};
 use drovr_core::{config, Engine, NewAgent};
@@ -25,12 +27,23 @@ async fn blocking<T: Send + 'static>(
     f: impl FnOnce(&Engine) -> anyhow::Result<T> + Send + 'static,
 ) -> Res<T> {
     tauri::async_runtime::spawn_blocking(move || {
+        path_ready();
         let engine = Engine::open()?;
         f(&engine)
     })
     .await
     .map_err(|e| e.to_string())?
     .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+async fn cli_status() -> Res<cli_install::CliStatus> {
+    blocking(|_| Ok(cli_install::status())).await
+}
+
+#[tauri::command]
+async fn install_cli() -> Res<String> {
+    blocking(|_| cli_install::install().map_err(anyhow::Error::msg)).await
 }
 
 #[derive(Serialize)]
@@ -49,10 +62,14 @@ struct Snapshot {
     groups: Vec<Group>,
     inbox: Vec<Item>,
     recent: Vec<Item>,
+    /// PRs waiting on your review (new or dispatched).
+    review_prs: Vec<drovr_core::store::ReviewPr>,
     unseen_reports: i64,
     herdr: bool,
     /// Whether the Codex CLI is installed, for agents with harness "codex".
     codex: bool,
+    /// Whether OpenCode is installed, for agents with harness "opencode".
+    opencode: bool,
 }
 
 #[tauri::command]
@@ -82,15 +99,17 @@ async fn snapshot() -> Res<Snapshot> {
             groups: e.store.groups()?,
             inbox: e.store.items(Some("pending"), 500)?,
             recent,
+            review_prs: e.store.review_prs(true)?,
             unseen_reports: drovr_core::reports::unseen(&e.store)?,
             herdr: installed(&e.cfg.herdr.command),
             codex: installed(&e.cfg.codex.command),
+            opencode: installed(&e.cfg.opencode.command),
         })
     })
     .await
 }
 
-/// Whether a command (herdr, codex) is installed. Checking starts a shell
+/// Whether a command (herdr, codex, opencode) is installed. Checking starts a shell
 /// and the window asks every two seconds, so answers are kept for half a
 /// minute.
 fn installed(command: &str) -> bool {
@@ -114,8 +133,8 @@ fn installed(command: &str) -> bool {
 // -- agents -------------------------------------------------------------------
 
 #[tauri::command]
-async fn agent_output(name: String, lines: usize) -> Res<Vec<Line>> {
-    blocking(move |e| e.output(&name, lines)).await
+async fn agent_output(name: String, lines: usize, pane: Option<bool>) -> Res<Vec<Line>> {
+    blocking(move |e| e.output_view(&name, lines, pane.unwrap_or(false))).await
 }
 
 #[tauri::command]
@@ -150,6 +169,8 @@ struct Defaults {
     model: String,
     /// Codex agents' default model (codex.model).
     codex_model: String,
+    /// OpenCode agents' default model (opencode.model).
+    opencode_model: String,
     permission_mode: String,
     worktrees: bool,
     plans_dir: String,
@@ -162,6 +183,8 @@ struct Defaults {
     copy_on_select: bool,
     /// The ticket workflow (record, timeline) is on.
     workflow: bool,
+    /// `[review]` has a Slack channel or a GitHub team: the PRs view shows.
+    review_enabled: bool,
     /// The skill agents follow to write a ticket for their task (jira.ticket_skill).
     ticket_skill: String,
 }
@@ -176,6 +199,7 @@ async fn defaults() -> Res<Defaults> {
             harness: d.harness.clone(),
             model: d.model.clone(),
             codex_model: e.cfg.codex.model.clone(),
+            opencode_model: e.cfg.opencode.model.clone(),
             permission_mode: d.permission_mode.clone(),
             worktrees: d.worktrees,
             plans_dir: e.cfg.reports.path().display().to_string(),
@@ -184,6 +208,8 @@ async fn defaults() -> Res<Defaults> {
             cost_warning_usd: d.cost_warning_usd,
             copy_on_select: d.copy_on_select,
             workflow: e.cfg.workflow.enabled,
+            review_enabled: !e.cfg.review.slack_channels.is_empty()
+                || !e.cfg.review.github_teams.is_empty(),
             ticket_skill: e.cfg.jira.ticket_skill.clone(),
         })
     })
@@ -309,17 +335,27 @@ async fn term_settings() -> Res<TermSettings> {
     .await
 }
 
-/// Recent Claude Code sessions, to start an agent from one.
+/// Recent sessions of a harness (Claude Code when empty), to start an
+/// agent from one.
 #[tauri::command]
-async fn claude_sessions() -> Res<Vec<drovr_core::sessions::SavedSession>> {
-    use drovr_core::harness::Harness;
-    blocking(|_| Ok(drovr_core::harness::CLAUDE.recent_sessions(40))).await
+async fn sessions(harness: Option<String>) -> Res<Vec<drovr_core::sessions::SavedSession>> {
+    blocking(move |_| {
+        Ok(drovr_core::harness::named(&harness.unwrap_or_default())?.recent_sessions(40))
+    })
+    .await
 }
 
 #[tauri::command]
-async fn find_session(id: String) -> Res<Option<drovr_core::sessions::SavedSession>> {
-    use drovr_core::harness::Harness;
-    blocking(move |_| Ok(drovr_core::harness::CLAUDE.find_session(id.trim()).ok())).await
+async fn find_session(
+    id: String,
+    harness: Option<String>,
+) -> Res<Option<drovr_core::sessions::SavedSession>> {
+    blocking(move |_| {
+        Ok(drovr_core::harness::named(&harness.unwrap_or_default())?
+            .find_session(id.trim())
+            .ok())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -421,6 +457,33 @@ async fn inbox_mark_ran(id: i64, note: String) -> Res<()> {
 #[tauri::command]
 async fn inbox_dismiss(id: i64) -> Res<()> {
     blocking(move |e| e.dismiss(id)).await
+}
+
+// -- PRs ----------------------------------------------------------------------
+
+#[tauri::command]
+async fn pr_dispatch(key: String) -> Res<()> {
+    blocking(move |e| e.dispatch_pr(&key).map(|_| ())).await
+}
+
+#[tauri::command]
+async fn pr_dismiss(key: String) -> Res<()> {
+    blocking(move |e| e.dismiss_pr(&key)).await
+}
+
+#[tauri::command]
+async fn pr_refresh() -> Res<()> {
+    blocking(|e| {
+        drovr_core::pr_review::poll(e, true);
+        Ok(())
+    })
+    .await
+}
+
+/// Whether PR polling is waiting on GitHub's API quota.
+#[tauri::command]
+async fn pr_hold() -> Res<drovr_core::quota::Hold> {
+    Ok(drovr_core::pr_review::hold())
 }
 
 #[tauri::command]
@@ -644,10 +707,34 @@ async fn start_retro(tickets: Vec<String>, note: String) -> Res<Agent> {
     blocking(move |e| e.start_retro(&tickets, &note)).await
 }
 
+/// The tickets a retro can be run on, and which list each is in.
+#[tauri::command]
+async fn retro_tickets() -> Res<Vec<drovr_core::retro::RetroTicket>> {
+    blocking(|e| e.retro_tickets()).await
+}
+
+/// Hide a ticket from the retro picker, or show it again.
+#[tauri::command]
+async fn set_retro_hidden(ticket: String, hidden: bool) -> Res<()> {
+    blocking(move |e| e.store.set_retro_hidden(&ticket, hidden)).await
+}
+
 /// Every retro, newest first, with its proposals.
 #[tauri::command]
 async fn retros() -> Res<Vec<drovr_core::retro::Retro>> {
     blocking(|e| Ok(e.retros())).await
+}
+
+/// What runs cost, by week (see `Engine::insights`).
+#[tauri::command]
+async fn insights(bounds: Vec<f64>) -> Res<drovr_core::insights::Insights> {
+    blocking(move |e| e.insights(&bounds)).await
+}
+
+/// How PRs merged from `from` up to `to` turned out, by model.
+#[tauri::command]
+async fn insights_models(from: f64, to: f64) -> Res<drovr_core::outcomes::Models> {
+    blocking(move |e| e.models(from, to)).await
 }
 
 /// Approve (and apply) or dismiss one of a retro's proposals.
@@ -791,6 +878,17 @@ async fn remote_info() -> Res<RemoteInfo> {
 }
 
 #[tauri::command]
+async fn cleanup_now() -> Res<Value> {
+    blocking(|e| {
+        let now = drovr_core::store::now();
+        let out = drovr_core::cleanup::run(&e.cfg, &e.store, now, false)?;
+        drovr_core::cleanup::mark_ran(&config::home(), now)?;
+        Ok(serde_json::to_value(out)?)
+    })
+    .await
+}
+
+#[tauri::command]
 async fn config_info() -> Res<Value> {
     blocking(|e| {
         let path = config::config_path();
@@ -822,35 +920,22 @@ async fn save_config(text: String) -> Res<()> {
     .await
 }
 
-/// Apps launched from Finder or the Dock get a minimal PATH
-/// (/usr/bin:/bin:/usr/sbin:/sbin), so `claude`, `herdr`, `node` and
-/// Homebrew tools wouldn't be found. Take PATH from the user's login shell.
-fn adopt_login_shell_path() {
-    if !cfg!(target_os = "macos") || std::env::var_os("DROVR_KEEP_PATH").is_some() {
-        return;
-    }
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
-    let script = "printf '__DROVR_PATH__%s__DROVR_PATH__' \"$PATH\"";
-    // Interactive so ~/.zshrc runs too; bounded in case it waits on something.
-    let cmd = format!("{} -l -i -c {}", quote(&shell), quote(script));
-    let Ok(out) = drovr_core::shell::sh(&cmd, None, None, Duration::from_secs(5)) else {
-        return;
-    };
-    if let Some(path) = out
-        .stdout
-        .split("__DROVR_PATH__")
-        .nth(1)
-        .filter(|p| !p.is_empty())
-    {
-        std::env::set_var("PATH", path);
-    }
+#[tauri::command]
+fn login_path_info() -> login_path::Info {
+    login_path::info()
+}
+
+/// Don't start work that spawns `gh`, `claude` or `opencode` before PATH is settled.
+fn path_ready() {
+    login_path::wait_ready(login_path::MAX_WAIT);
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    adopt_login_shell_path();
+    login_path::start();
     // Notice headless runs that died without reporting back, and track herdr panes.
     std::thread::spawn(|| loop {
+        path_ready();
         if let Ok(e) = Engine::open() {
             let _ = e.refresh();
             let _ = e.refresh_herdr();
@@ -860,10 +945,43 @@ pub fn run() {
     // The ticket workflow's watcher: Jira and PR status, polled as each
     // falls due (watch.jira_poll_secs, watch.pr_poll_secs).
     std::thread::spawn(|| loop {
+        path_ready();
         if let Ok(e) = Engine::open() {
+            if let Err(err) = e.import_spend() {
+                eprintln!("drovr: importing what past runs cost: {err:#}");
+            }
+            if let Err(err) = e.import_outcomes() {
+                eprintln!("drovr: importing what became of past PRs: {err:#}");
+            }
             if e.cfg.workflow.enabled {
                 drovr_core::watch::poll(&e, false);
             }
+            let now = drovr_core::store::now();
+            if drovr_core::cleanup::due(&config::home(), now) {
+                let ran = drovr_core::cleanup::run(&e.cfg, &e.store, now, false);
+                match ran {
+                    Ok(out) => {
+                        for err in &out.errors {
+                            eprintln!("drovr: cleanup: {err}");
+                        }
+                    }
+                    Err(err) => eprintln!("drovr: cleanup: {err:#}"),
+                }
+                if let Err(err) = drovr_core::cleanup::mark_ran(&config::home(), now) {
+                    eprintln!("drovr: cleanup: {err:#}");
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_secs(15));
+    });
+    // PRs to review ([review] in the config). Its own thread: a slow Slack
+    // read mustn't hold up the watcher above.
+    std::thread::spawn(|| loop {
+        path_ready();
+        if let Ok(e) = Engine::open() {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                drovr_core::pr_review::poll(&e, false)
+            }));
         }
         std::thread::sleep(Duration::from_secs(15));
     });
@@ -871,6 +989,7 @@ pub fn run() {
     if let Ok(cfg) = drovr_core::Config::load() {
         if cfg.remote.enabled {
             std::thread::spawn(move || {
+                path_ready();
                 if let Err(e) = drovr_core::remote::serve(&cfg) {
                     eprintln!("drovr: phone page: {e:#}");
                 }
@@ -892,6 +1011,9 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             menu::load_theme,
             menu::save_theme,
+            cli_status,
+            login_path_info,
+            install_cli,
             snapshot,
             agent_output,
             new_agent,
@@ -899,7 +1021,7 @@ pub fn run() {
             add_lead,
             defaults,
             plans_folders,
-            claude_sessions,
+            sessions,
             find_session,
             read_prompt,
             prompt_agent,
@@ -910,7 +1032,11 @@ pub fn run() {
             watch_state,
             watch_now,
             start_retro,
+            retro_tickets,
+            set_retro_hidden,
             retros,
+            insights,
+            insights_models,
             decide_proposal,
             stop_agent,
             stop_group,
@@ -923,6 +1049,10 @@ pub fn run() {
             inbox_reject,
             inbox_mark_ran,
             inbox_dismiss,
+            pr_dispatch,
+            pr_dismiss,
+            pr_refresh,
+            pr_hold,
             run_command,
             bus,
             send_message,
@@ -938,6 +1068,7 @@ pub fn run() {
             review_diff,
             push_preview,
             push_github_moved,
+            cleanup_now,
             config_info,
             save_config,
             remote_info,

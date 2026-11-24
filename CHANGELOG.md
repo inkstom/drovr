@@ -1,5 +1,58 @@
 # Changelog
 
+## [0.17.1](https://github.com/izz-linux/drovr/compare/v0.17.0...v0.17.1) (2026-11-24)
+
+
+### Bug Fixes
+
+* leave retros with no logged cost out of the average ([#102](https://github.com/izz-linux/drovr/issues/102)) ([43f5dae](https://github.com/izz-linux/drovr/commit/43f5daee977b2d5cfd7a108469080c596d216f49))
+* show spend by day in Insights ([#103](https://github.com/izz-linux/drovr/issues/103)) ([6e0424d](https://github.com/izz-linux/drovr/commit/6e0424da887406311ec015a78cb957c75441defb))
+
+## [0.17.0](https://github.com/izz-linux/drovr/compare/v0.16.2...v0.17.0) (2026-11-24)
+
+
+### Features
+
+* back off polling as GitHub's API quota runs low ([#90](https://github.com/izz-linux/drovr/issues/90)) ([8b7f2b8](https://github.com/izz-linux/drovr/commit/8b7f2b8c385b56feeb8a5c2b9d221c9d5c91b287))
+* compare models on what became of their PRs ([#99](https://github.com/izz-linux/drovr/issues/99)) ([f17d0db](https://github.com/izz-linux/drovr/commit/f17d0db5d39890797fe9e0b1035636221c53ac40))
+* give every theme chart colors ([#97](https://github.com/izz-linux/drovr/issues/97)) ([3a7fa69](https://github.com/izz-linux/drovr/commit/3a7fa695daae356da3a01e1a524761ddd382da60))
+* log what every run costs ([#96](https://github.com/izz-linux/drovr/issues/96)) ([22cd6ae](https://github.com/izz-linux/drovr/commit/22cd6ae2afdbc191b8d8e9a7ce7436100f68cb45))
+* move retros to Insights and hide covered tickets ([#101](https://github.com/izz-linux/drovr/issues/101)) ([f92f78c](https://github.com/izz-linux/drovr/commit/f92f78c3e1161287bdc4117b8d58f648640df81d))
+* show what runs cost in Insights ([#98](https://github.com/izz-linux/drovr/issues/98)) ([6403e64](https://github.com/izz-linux/drovr/commit/6403e6464d242919f4583ed36824053b875bf739))
+
+
+### Bug Fixes
+
+* record each model's cost and count a model under one name ([#93](https://github.com/izz-linux/drovr/issues/93)) ([a5de86b](https://github.com/izz-linux/drovr/commit/a5de86b86dc91e7cb6e93246eeaa5161d30dbcbb))
+* record retros and PR changes on tickets with no live agents ([#92](https://github.com/izz-linux/drovr/issues/92)) ([5c46f25](https://github.com/izz-linux/drovr/commit/5c46f256b1cf49ecc7eb170b22253474de7a8929))
+* send builders every unresolved review thread ([#94](https://github.com/izz-linux/drovr/issues/94)) ([cec9296](https://github.com/izz-linux/drovr/commit/cec92965c16317863a006c5cdfe3ecf05b60809b))
+
+## [0.16.2](https://github.com/izz-linux/drovr/compare/v0.16.1...v0.16.2) (2026-11-19)
+
+
+### Bug Fixes
+
+* list Settings last in the sidebar, after Pipeline ([#88](https://github.com/izz-linux/drovr/issues/88)) ([17a9b45](https://github.com/izz-linux/drovr/commit/17a9b452855a7e402075736b456c4c9b4fa8aa95))
+
+## [0.16.1](https://github.com/izz-linux/drovr/compare/v0.16.0...v0.16.1) (2026-11-19)
+
+
+### Bug Fixes
+
+* re-offer a dismissed PR when it's posted in a watched channel ([#86](https://github.com/izz-linux/drovr/issues/86)) ([0fce43f](https://github.com/izz-linux/drovr/commit/0fce43f974941d0bf4235c5f0904ce4067eabc5f))
+
+## [0.16.0](https://github.com/izz-linux/drovr/compare/v0.15.1...v0.16.0) (2026-11-19)
+
+
+### Features
+
+* add a PRs view for PRs waiting on your review ([#85](https://github.com/izz-linux/drovr/issues/85)) ([e85e1b7](https://github.com/izz-linux/drovr/commit/e85e1b7a26c073597d43c979483bdcb71efee79a))
+
+
+### Bug Fixes
+
+* keep a working PATH when the login shell is slow after a reboot ([#83](https://github.com/izz-linux/drovr/issues/83)) ([d01134d](https://github.com/izz-linux/drovr/commit/d01134d5e34b6f23f58edf58af1f03a66ac1551c))
+
 ## [0.15.1](https://github.com/izz-linux/drovr/compare/v0.15.0...v0.15.1) (2026-11-19)
 
 

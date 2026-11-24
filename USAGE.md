@@ -10,8 +10,11 @@ How to get things done with drovr, in the app and from the command line. For wha
 
 | Keys | Does |
 | --- | --- |
-| ⌘1 … ⌘8 | Agents, Inbox, Reports, Jira, Slack · Confluence, Message bus, Code review, Settings |
+| ⌘1 … ⌘7 | Agents, Inbox, Reports, Jira, Slack · Confluence, Message bus, Code review |
+| ⌘8 | PRs (once `[review]` has a Slack channel or a GitHub team, or PRs are listed) |
 | ⌘9 | Pipeline (with `workflow.enabled`) |
+| ⌘0 | Insights |
+| ⌘, | Settings (**drovr → Settings…**) |
 | ⌘N | New agent |
 | ⌘G | New group |
 | Enter | Send the prompt (in an agent's prompt box) |
@@ -178,13 +181,16 @@ drovr attach pay-api-lead          # prints: cd … && claude --resume …
 
    PR reviewers follow `stages.review_skill` and run on `stages.models.review` (harness `defaults.harness`). To only review PRs in some GitHub orgs, set `owners = ["my-org"]`.
 
-   Slack is read through your Slack provider, and `gh` must be signed in. With `provider = "agent"`, each poll is a short `claude -p` run, so it costs a little each time; raise `poll_secs` (600 by default) to poll less. `drovr review poll` looks right away.
-2. **Check the Inbox.** Each new PR shows up once as a **PR review** item with its title, where it came from and a link. Closed PRs and your own aren't offered. A draft requested from your team is offered once it's ready; one linked in Slack is skipped. Slack is read back one day on the first poll, and never more than 7. **Dispatch reviewer** starts the reviewer and **Dismiss** drops the item. With `review.auto_dispatch = true` it starts without asking: the item always appears, already answered ("Reviewer <name> started"), under resolved, and it's a pending item with the error only if the reviewer couldn't start.
+   Slack is read through your Slack provider, and `gh` must be signed in. With `provider = "agent"`, each poll is a short `claude -p` run, so it costs a little each time; raise `poll_secs` (600 by default) to poll less. `drovr review poll` looks right away. As your GitHub API quota runs low, polls slow down and then wait for its reset; PRs shows "GitHub quota low, next check 11:09", and **Refresh** and `drovr review poll` run unless a quota is empty.
+2. **Open PRs (⌘8).** Each PR waiting on you is listed once, in **New** until you decide and in **Reviewing** once it has a reviewer. A row shows `owner/repo#n`, the title, the author, where it came from (`#channel`, or `team org/slug`), its age, CI (✓ ✗ ●), GitHub's review decision and your own latest review (waiting on you, you approved, you requested changes, you commented). Closed PRs and your own aren't offered. If drovr can't tell your GitHub login, nothing is offered until it can, and your own PRs already in New are removed on a refresh. A draft requested from your team is offered once it's ready; one linked in Slack is skipped. Slack is read back one day on the first poll, and never more than 7. PRs no longer go to the Inbox: new ones raise a notification while drovr is in the background ("PR to review", or "N PRs to review"), the PRs item in the sidebar shows how many are new, and the Dock badge is the Inbox count plus that number. Each poll (`review.poll_secs`) refreshes every listed PR's state, CI and reviews; **Refresh** polls right away.
+   - **New:** **Dispatch reviewer** starts the reviewer, **Dismiss** hides the PR, **Open on GitHub** opens it. If the reviewer can't start (a clone or fetch failed), a message says why and the PR stays in New.
+   - **Reviewing:** it shows "Starting…" while the reviewer starts, then the reviewer's state (working, idle, reported, error). **Open reviewer** goes to the agent in Agents, where you can tell it to post. **Report** opens its "Review owner/repo#n" report once there is one. **Dismiss** removes the reviewer, its worktree and branch, and hides the PR.
+   - **Lifecycle:** a PR leaves the list when you dismiss it, or when GitHub shows it merged or closed (the reviewer is removed too, per `review.remove_when_closed`). A PR you dismissed comes back if someone posts it in a watched channel after you dismissed it. With `review.auto_dispatch = true` a PR starts in Reviewing, and in New only if the reviewer couldn't start. `drovr review <url>` lists the PR in Reviewing too.
 3. **Let it work.** The reviewer gets its own folder, and the PR's head is checked out in `./pr` inside it, from the clone in `<repos_dir>/<repo>` (cloned with `gh` if it's missing). It runs outside `pr`, so the PR's own agent config (hooks, MCP servers, OpenCode and Codex config) is never loaded. It reads the PR, doesn't run its code, scripts or tests unless you ask, publishes a report titled "Review owner/repo#n" and messages you a summary. It stays running, so you can ask follow-ups.
 4. **Tell it to post.** It changes nothing on GitHub until you say so, for example "post this as a review with those two comments". That's a rule in its instructions, so for a hard stop keep `gh pr review` and `gh pr comment` out of `permissions.auto_allow`: each post then asks in the Inbox.
-5. **Clean up.** **✕**, then **Remove?**, deletes its worktree and branch even if it has uncommitted files. With `review.remove_when_closed = true` (the default), a reviewer that isn't working is removed once its PR merges or closes.
+5. **Clean up.** **✕**, then **Remove?**, deletes its worktree and branch even if it has uncommitted files; its PR stays in **PRs** as *reviewer gone* until you dismiss it or it merges. With `review.remove_when_closed = true` (the default), a reviewer that isn't working is removed once its PR merges or closes.
 
-To review one PR by hand, run `drovr review <pr-url>`.
+To review one PR by hand, run `drovr review <pr-url>`. The phone page doesn't show PRs yet.
 
 ### Look things up in Jira, Confluence and Slack
 
@@ -289,6 +295,12 @@ drovr leaves OpenCode's providers to your own config. The config drovr writes fo
 2. If **Run with → OpenCode** says `opencode not found`, set `opencode.command` to its full path (for example `/Users/you/.opencode/bin/opencode`).
 3. Allow the gateway's MCP tools by Claude Code's names: a server `my_gateway`'s tool `search` is `mcp__my_gateway__search` in `permissions.auto_allow`.
 
+#### `command not found` for `gh`, `opencode` or `claude`
+
+An app opened from the Dock starts with macOS's bare PATH (`/usr/bin:/bin:/usr/sbin:/sbin`), so drovr asks your shell for yours at startup: first your interactive login shell (`$SHELL -l -i`, which reads `~/.zshrc`; up to 20 seconds, plus up to 3 more to stop it), then a non-interactive login shell (`$SHELL -l`, which reads `~/.zprofile`; up to 10 seconds, plus up to 3). The PATH that worked is saved to `login-path` in drovr's state folder, and drovr uses that saved one if neither shell answers (a slow first shell after a reboot, say). It always appends `/opt/homebrew/bin`, `/opt/homebrew/sbin`, `/usr/local/bin`, `~/.local/bin`, `~/.opencode/bin` and `~/.cargo/bin` when they exist and aren't already there. Both probes run with no stdin and no terminal (and `SSH_ASKPASS_REQUIRE=never`, `GIT_TERMINAL_PROMPT=0`, `DISABLE_AUTO_UPDATE=true`), so a prompt fails at once instead of blocking. With a saved PATH drovr starts at once on it and settles in the background; on the very first launch (nothing saved) its background work waits, at most about 41 seconds in the worst case, before it first runs `gh`, `claude` or `opencode`.
+
+**Settings** shows which one drovr used ("PATH: from your shell", "from your login profile", "saved from an earlier start", or "macOS's default"), and drovr logs `drovr: PATH from <source> (<ms> ms)` to stderr. If your interactive shell never answers, something in your `~/.zshrc` is probably waiting for input (an `ssh-add` passphrase, an oh-my-zsh update question, an MFA helper); run `zsh -l -i -c 'echo done'` in a terminal to see it, and if that is slow rather than waiting for a prompt, look for a stale lock file left by a tool such as pyenv (`~/.pyenv/shims/.pyenv-shim`; delete it if no `pyenv rehash` is running). When a probe or a command times out, drovr sends it SIGTERM and gives it up to 3 seconds to clean up before SIGKILL, so it doesn't leave such locks behind. If it says macOS's default, or your shell is slow, either move your PATH setup (Homebrew's `eval "$(/opt/homebrew/bin/brew shellenv)"`, say) into `~/.zprofile`, which the fallback reads, or set full paths: `watch.gh`, `opencode.command`, `claude.command`. Set `DROVR_KEEP_PATH` to skip all of this.
+
 Costs come from what OpenCode reports for each step. If your OpenCode setup has no prices for a gateway's models, its runs show $0 and `defaults.cost_warning_usd` never flags them.
 
 ### Run an agent with Codex (experimental)
@@ -306,7 +318,7 @@ Set `defaults.harness = "codex"` to make Codex the preselected choice. Codex age
 
 ### Turn the ticket workflow on or off
 
-Everything in the next few sections is behind one switch. In **Settings** (⌘8), set it and save (⌘S); it applies straight away, and agents pick it up on their next run:
+Everything in the next few sections is behind one switch. In **Settings** (⌘,), set it and save (⌘S); it applies straight away, and agents pick it up on their next run:
 
 ```toml
 [workflow]
@@ -329,7 +341,7 @@ Turning it on doesn't change groups you already have: only groups created while 
    jql = "project = SRE AND sprint in openSprints() AND assignee = currentUser()"
    github_repos = ["yourorg/*"]
    ```
-2. **Pipeline** (⌘9): each ticket's Jira status, its agents, its PRs (CI ✓ ✗ ●, review state, conflicts, drafts), what's waiting for you and what it's cost. A PR belongs to a ticket when its title has the key. **Refresh now** reads Jira and GitHub straight away; errors show at the top.
+2. **Pipeline** (⌘9): each ticket's Jira status, its agents, its PRs (CI ✓ ✗ ●, review state, conflicts, drafts), what's waiting for you and what it's cost. A PR belongs to a ticket when its title has the key. **Refresh now** reads Jira and GitHub straight away; errors show at the top. When your GitHub API quota is low, the header says when GitHub is next checked; **Refresh now** still reads it unless a quota is empty.
 3. **Decide what happens on a change** with `[watch.rules]`: per trigger (`ci_failed`, `ci_passed`, `changes_requested`, `new_review`, `ready_for_review`, `conflict`, `approved_green`, `merged`, `pr_closed`, `jira_changed`), `"wake"` the agent with the details, `"ask"` you in the Inbox, or `"ignore"`. Start with `"ask"` everywhere and loosen one at a time.
 4. **Jira updates:** with `jira.comment_cmd` set, a merge drafts a comment for you to edit and post (and a move, with `watch.merged_transition`). With `watch.dispatch_transition`, dispatching a ticket moves it straight away, say to In Progress. For twg, a transition is its id: `twg jira workitem transition --id SRE-123 -o json` lists them without moving anything.
 
@@ -347,9 +359,9 @@ Turning it on doesn't change groups you already have: only groups created while 
 
 ### Run a retro
 
-1. **Start it:** **Start retro** in a ticket's timeline, or **Retro…** in Pipeline for several tickets, with a note if there's something to look at in particular. The picker shows when each ticket last had a retro. Tickets with nothing new since then are under **with nothing new since their retro**.
+1. **Start it:** **Start retro** in a ticket's timeline, or **Retro…** under **Retros** in Insights (⌘0) for several tickets, with a note if there's something to look at in particular. The picker lists tickets as **Not covered**, **New work**, **Covered** or **Hidden**, with their runs and cost since their last retro. **Hide** and **Show** move one; a decided one hides itself until there's new work on it (`retro.hide_decided`).
 2. A retro agent reads the records and the numbers drovr works out (cost by stage and model, rework, dismissals, misses) and proposes changes to stage models, checkpoint limits, wake rules, the process and your skills, each with its evidence. It's told what earlier retros proposed and what you decided, so it doesn't bring back what you dismissed without new evidence.
-3. **Decide:** under **Retros** in Pipeline, approve or dismiss each, or **Approve all**. Approving applies it: a config change keeps your file's comments and saves the previous one as `config.toml.before-retro`; a skill is written to `retro.skills_dir`. A retro you've decided all of folds away under **N finished retros**.
+3. **Decide:** under **Retros** in Insights, approve or dismiss each, or **Approve all**. Approving applies it: a config change keeps your file's comments and saves the previous one as `config.toml.before-retro`; a skill is written to `retro.skills_dir`. A retro you've decided all of folds away under **N finished retros**.
 
 ### Have an agent write a Confluence page
 
@@ -386,7 +398,9 @@ Agent and group names are lowercase letters, digits, `-` and `_`, starting with 
 | `drovr sessions` | List recent Claude Code sessions (`--harness opencode`: OpenCode's) |
 | `drovr adopt <session-id> <name> [--fork] [task…]` | Start an agent from an existing Claude Code session, or an OpenCode one (`ses_…`) |
 | `drovr review <pr-url>` | Start a read-only reviewer for a GitHub PR in its own worktree; prints `started <name> in <cwd>` |
-| `drovr review poll` | Look now for PRs to review (see `[review]`) and offer the new ones in the Inbox; prints `offered <owner>/<repo>#<n>: <title> (<source>)` for each, or `nothing new`; with nothing to watch it says `review polling is off: set review.slack_channels or review.github_teams` |
+| `drovr review poll` | Look now for PRs to review (see `[review]`) and list the new ones in PRs; prints `offered <owner>/<repo>#<n>: <title> (<source>)` for each, or `nothing new`; with a GitHub API quota empty it says `GitHub API quota used up: not polled`; with nothing to watch it says `review polling is off: set review.slack_channels or review.github_teams` |
+| `drovr review list` | List the PRs waiting on you, one per line: `new` or `reviewing`, `owner/repo#n`, the title, `(source)` and the reviewer's name; `No PRs waiting on you.` when there are none |
+| `drovr review dismiss <pr-url>` | Hide a PR from PRs; its reviewer, worktree and branch are removed; prints `dismissed <url>` |
 | `drovr prompt <agent> <text…>` | Send an agent a prompt (queued if it's busy) |
 | `drovr stop <agent>` | Stop an agent's current run |
 | `drovr resume <agent> [text…]` | Resume a stopped, failed or interrupted agent |

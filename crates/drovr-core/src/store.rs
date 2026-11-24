@@ -83,6 +83,69 @@ CREATE TABLE IF NOT EXISTS notes (
     ts REAL NOT NULL,
     PRIMARY KEY (group_name, key)
 );
+CREATE TABLE IF NOT EXISTS review_prs (
+    key TEXT PRIMARY KEY,
+    url TEXT NOT NULL DEFAULT '',
+    owner TEXT NOT NULL DEFAULT '',
+    repo TEXT NOT NULL DEFAULT '',
+    number INTEGER NOT NULL DEFAULT 0,
+    title TEXT NOT NULL DEFAULT '',
+    author TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL DEFAULT '',
+    permalink TEXT NOT NULL DEFAULT '',
+    poster TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'new',
+    agent TEXT NOT NULL DEFAULT '',
+    offered_ts REAL NOT NULL DEFAULT 0,
+    decided_ts REAL NOT NULL DEFAULT 0,
+    checked_ts REAL NOT NULL DEFAULT 0,
+    pr_state TEXT NOT NULL DEFAULT '',
+    ci TEXT NOT NULL DEFAULT '',
+    review_decision TEXT NOT NULL DEFAULT '',
+    my_review TEXT NOT NULL DEFAULT '',
+    draft INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS spend (
+    key TEXT PRIMARY KEY,
+    ts REAL NOT NULL,
+    agent TEXT NOT NULL,
+    role TEXT NOT NULL DEFAULT '',
+    group_name TEXT NOT NULL DEFAULT '',
+    tickets TEXT NOT NULL DEFAULT '',
+    stage TEXT NOT NULL DEFAULT '',
+    harness TEXT NOT NULL DEFAULT '',
+    started_as TEXT NOT NULL DEFAULT '',
+    model TEXT NOT NULL DEFAULT '',
+    run INTEGER NOT NULL DEFAULT 0,
+    main INTEGER NOT NULL DEFAULT 1,
+    cost_usd REAL,
+    tokens_in INTEGER,
+    tokens_out INTEGER,
+    cache_read INTEGER,
+    cache_write INTEGER,
+    duration_ms INTEGER,
+    state TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL DEFAULT 'run'
+);
+CREATE INDEX IF NOT EXISTS spend_ts ON spend (ts);
+CREATE TABLE IF NOT EXISTS pr_outcomes (
+    url TEXT PRIMARY KEY,
+    data TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS build_send_backs (
+    ts REAL NOT NULL,
+    agent TEXT NOT NULL,
+    PRIMARY KEY (ts, agent)
+);
+CREATE TABLE IF NOT EXISTS retro_hidden (
+    ticket TEXT PRIMARY KEY,
+    hidden INTEGER NOT NULL,
+    ts REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS done_once (
+    what TEXT PRIMARY KEY,
+    ts REAL NOT NULL
+);
 "#;
 
 pub fn now() -> f64 {
@@ -197,6 +260,62 @@ pub struct ReportMeta {
     pub seen: bool,
 }
 
+/// A PR waiting on your review, from the poll to its merge.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ReviewPr {
+    /// The lowercased canonical URL.
+    pub key: String,
+    pub url: String,
+    pub owner: String,
+    pub repo: String,
+    pub number: i64,
+    pub title: String,
+    pub author: String,
+    /// `#channel`, or `team org/slug`.
+    pub source: String,
+    pub permalink: String,
+    pub poster: String,
+    /// new | dispatched | dismissed | closed
+    pub status: String,
+    pub agent: String,
+    pub offered_ts: f64,
+    pub decided_ts: f64,
+    pub checked_ts: f64,
+    /// GitHub's state: OPEN, MERGED or CLOSED.
+    pub pr_state: String,
+    /// success | failure | pending | none
+    pub ci: String,
+    pub review_decision: String,
+    /// The state of your own latest review, or empty.
+    pub my_review: String,
+    pub draft: bool,
+}
+
+fn review_pr_row(r: &Row) -> rusqlite::Result<ReviewPr> {
+    Ok(ReviewPr {
+        key: r.get("key")?,
+        url: r.get("url")?,
+        owner: r.get("owner")?,
+        repo: r.get("repo")?,
+        number: r.get("number")?,
+        title: r.get("title")?,
+        author: r.get("author")?,
+        source: r.get("source")?,
+        permalink: r.get("permalink")?,
+        poster: r.get("poster")?,
+        status: r.get("status")?,
+        agent: r.get("agent")?,
+        offered_ts: r.get("offered_ts")?,
+        decided_ts: r.get("decided_ts")?,
+        checked_ts: r.get("checked_ts")?,
+        pr_state: r.get("pr_state")?,
+        ci: r.get("ci")?,
+        review_decision: r.get("review_decision")?,
+        my_review: r.get("my_review")?,
+        draft: r.get::<_, i64>("draft")? != 0,
+    })
+}
+
 pub struct Store {
     db: Connection,
 }
@@ -254,6 +373,31 @@ fn message_row(r: &Row) -> rusqlite::Result<Message> {
     })
 }
 
+fn spend_row(r: &Row) -> rusqlite::Result<crate::spend::Row> {
+    Ok(crate::spend::Row {
+        key: r.get("key")?,
+        ts: r.get("ts")?,
+        agent: r.get("agent")?,
+        role: r.get("role")?,
+        group_name: r.get("group_name")?,
+        tickets: r.get("tickets")?,
+        stage: r.get("stage")?,
+        harness: r.get("harness")?,
+        started_as: r.get("started_as")?,
+        model: r.get("model")?,
+        run: r.get("run")?,
+        main: r.get("main")?,
+        cost_usd: r.get("cost_usd")?,
+        tokens_in: r.get("tokens_in")?,
+        tokens_out: r.get("tokens_out")?,
+        cache_read: r.get("cache_read")?,
+        cache_write: r.get("cache_write")?,
+        duration_ms: r.get("duration_ms")?,
+        state: r.get("state")?,
+        source: r.get("source")?,
+    })
+}
+
 impl Store {
     pub fn open_default() -> Result<Store> {
         Store::open(&crate::config::home().join("drovr.db"))
@@ -307,7 +451,42 @@ impl Store {
         if !has_title {
             db.execute_batch("ALTER TABLE report_meta ADD COLUMN title TEXT NOT NULL DEFAULT ''")?;
         }
-        Ok(Store { db })
+        let store = Store { db };
+        store.move_review_items()?;
+        Ok(store)
+    }
+
+    /// Databases from before the PRs view: pending `review` Inbox items
+    /// become `new` rows.
+    fn move_review_items(&self) -> Result<()> {
+        let any = self
+            .db
+            .prepare("SELECT 1 FROM inbox WHERE kind = 'review' AND status = 'pending' LIMIT 1")?
+            .exists([])?;
+        if !any {
+            return Ok(());
+        }
+        for item in self.items(Some("pending"), i64::MAX)? {
+            if item.kind != "review" {
+                continue;
+            }
+            let p = &item.payload;
+            let url = p["url"].as_str().unwrap_or("");
+            let Some((owner, repo, number)) = crate::pr_review::parse(url) else {
+                self.resolve_item(item.id, "answered", "Couldn't move to PRs")?;
+                continue;
+            };
+            let text = |k: &str| p[k].as_str().unwrap_or("").to_string();
+            let key = crate::pr_review::key(url);
+            let url = crate::pr_review::canonical(url).unwrap_or_else(|| url.to_string());
+            self.db.execute(
+                "INSERT OR IGNORE INTO review_prs (key, url, owner, repo, number, title, author, source, status, offered_ts) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'new', ?9)",
+                params![key, url, owner, repo, number as i64, text("title"), text("author"), text("source"), item.ts],
+            )?;
+            self.resolve_item(item.id, "answered", "Moved to PRs")?;
+        }
+        Ok(())
     }
 
     // -- groups ---------------------------------------------------------------
@@ -448,6 +627,196 @@ impl Store {
         Ok(())
     }
 
+    // -- spend ---------------------------------------------------------------
+
+    /// Add rows to the spend log, leaving out any it has.
+    pub fn add_spend(&self, rows: &[crate::spend::Row]) -> Result<usize> {
+        let tx = self.db.unchecked_transaction()?;
+        let n = self.insert_spend(rows)?;
+        tx.commit()?;
+        Ok(n)
+    }
+
+    fn insert_spend(&self, rows: &[crate::spend::Row]) -> Result<usize> {
+        let mut stmt = self.db.prepare(
+            "INSERT OR IGNORE INTO spend (key, ts, agent, role, group_name, tickets, stage, \
+             harness, started_as, model, run, main, cost_usd, tokens_in, tokens_out, \
+             cache_read, cache_write, duration_ms, state, source) VALUES \
+             (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
+             ?18, ?19, ?20)",
+        )?;
+        let mut n = 0;
+        for r in rows {
+            n += stmt.execute(params![
+                r.key,
+                r.ts,
+                r.agent,
+                r.role,
+                r.group_name,
+                r.tickets,
+                r.stage,
+                r.harness,
+                r.started_as,
+                r.model,
+                r.run,
+                r.main,
+                r.cost_usd,
+                r.tokens_in,
+                r.tokens_out,
+                r.cache_read,
+                r.cache_write,
+                r.duration_ms,
+                r.state,
+                r.source,
+            ])?;
+        }
+        Ok(n)
+    }
+
+    /// The spend log from `ts` on, oldest first.
+    pub fn spend_since(&self, ts: f64) -> Result<Vec<crate::spend::Row>> {
+        let mut stmt = self
+            .db
+            .prepare("SELECT * FROM spend WHERE ts >= ?1 ORDER BY ts, key")?;
+        let rows = stmt.query_map([ts], spend_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Whether `what`, which is only done once per database, was done.
+    pub fn done_once(&self, what: &str) -> Result<bool> {
+        Ok(self
+            .db
+            .prepare("SELECT 1 FROM done_once WHERE what = ?1")?
+            .exists([what])?)
+    }
+
+    /// Add imported rows, leaving out runs the log already has, and mark
+    /// `what` done. Adds nothing if another process did it first.
+    pub fn import_spend(&self, what: &str, rows: &[crate::spend::Row]) -> Result<usize> {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        if self.done_once(what)? {
+            return Ok(0);
+        }
+        let mut logged = self.db.prepare(
+            "SELECT 1 FROM spend WHERE source = 'run' AND agent = ?1 AND run = ?2 \
+             AND abs(ts - ?3) < 60",
+        )?;
+        let mut new = vec![];
+        for r in rows {
+            if !logged.exists(params![r.agent, r.run, r.ts])? {
+                new.push(r.clone());
+            }
+        }
+        drop(logged);
+        let n = self.insert_spend(&new)?;
+        self.db.execute(
+            "INSERT INTO done_once (what, ts) VALUES (?1, ?2)",
+            params![what, now()],
+        )?;
+        tx.commit()?;
+        Ok(n)
+    }
+
+    // -- what became of PRs ---------------------------------------------------
+
+    pub fn outcomes(&self) -> Result<Vec<crate::outcomes::Outcome>> {
+        let mut stmt = self
+            .db
+            .prepare("SELECT data FROM pr_outcomes ORDER BY url")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.map(|r| Ok(serde_json::from_str(&r?)?)).collect()
+    }
+
+    pub fn outcome(&self, url: &str) -> Result<Option<crate::outcomes::Outcome>> {
+        let data: Option<String> = self
+            .db
+            .query_row("SELECT data FROM pr_outcomes WHERE url = ?1", [url], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        Ok(data.map(|d| serde_json::from_str(&d)).transpose()?)
+    }
+
+    pub fn save_outcome(&self, o: &crate::outcomes::Outcome) -> Result<()> {
+        self.db.execute(
+            "INSERT OR REPLACE INTO pr_outcomes (url, data) VALUES (?1, ?2)",
+            params![o.url, serde_json::to_string(o)?],
+        )?;
+        Ok(())
+    }
+
+    /// Add imported outcomes and send-backs, leaving out any it has, and mark
+    /// `what` done. Adds nothing if another process did it first.
+    pub fn import_outcomes(
+        &self,
+        what: &str,
+        outcomes: &[crate::outcomes::Outcome],
+        send_backs: &[(f64, String)],
+    ) -> Result<usize> {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        if self.done_once(what)? {
+            return Ok(0);
+        }
+        let mut n = 0;
+        for o in outcomes {
+            n += self.db.execute(
+                "INSERT OR IGNORE INTO pr_outcomes (url, data) VALUES (?1, ?2)",
+                params![o.url, serde_json::to_string(o)?],
+            )?;
+        }
+        for (ts, agent) in send_backs {
+            self.add_send_back(*ts, agent)?;
+        }
+        self.db.execute(
+            "INSERT INTO done_once (what, ts) VALUES (?1, ?2)",
+            params![what, now()],
+        )?;
+        tx.commit()?;
+        Ok(n)
+    }
+
+    /// When you sent a build agent's handoff back, oldest first.
+    pub fn send_backs(&self) -> Result<Vec<(f64, String)>> {
+        let mut stmt = self
+            .db
+            .prepare("SELECT ts, agent FROM build_send_backs ORDER BY ts, agent")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn add_send_back(&self, ts: f64, agent: &str) -> Result<()> {
+        self.db.execute(
+            "INSERT OR IGNORE INTO build_send_backs (ts, agent) VALUES (?1, ?2)",
+            params![ts, agent],
+        )?;
+        Ok(())
+    }
+
+    // -- tickets hidden from the retro picker --------------------------------
+
+    /// What you last chose for each ticket, and when.
+    pub fn retro_hidden(&self) -> Result<std::collections::BTreeMap<String, (bool, f64)>> {
+        let mut stmt = self
+            .db
+            .prepare("SELECT ticket, hidden, ts FROM retro_hidden")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, (r.get(1)?, r.get(2)?))))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn set_retro_hidden(&self, ticket: &str, hidden: bool) -> Result<()> {
+        self.db.execute(
+            "INSERT OR REPLACE INTO retro_hidden (ticket, hidden, ts) VALUES (?1, ?2, ?3)",
+            params![ticket, hidden, now()],
+        )?;
+        Ok(())
+    }
+
     // -- messages -------------------------------------------------------------
 
     pub fn send(&self, sender: &str, recipient: &str, body: &str, group: &str) -> Result<i64> {
@@ -575,6 +944,118 @@ impl Store {
             params![status, answer, now(), id],
         )?;
         Ok(n == 1)
+    }
+
+    // -- PRs to review --------------------------------------------------------
+
+    /// Add a PR, or refresh what's known about it. A PR already there keeps
+    /// its status, agent and timestamps.
+    pub fn upsert_review_pr(&self, p: &ReviewPr) -> Result<()> {
+        self.db.execute(
+            "INSERT INTO review_prs (key, url, owner, repo, number, title, author, source, permalink, poster, status, agent, offered_ts) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
+             ON CONFLICT(key) DO UPDATE SET url = ?2, owner = ?3, repo = ?4, number = ?5, title = ?6, \
+             author = ?7, source = ?8, permalink = ?9, poster = ?10",
+            params![
+                p.key, p.url, p.owner, p.repo, p.number, p.title, p.author, p.source, p.permalink,
+                p.poster, p.status, p.agent, p.offered_ts
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The rows still waiting (`new` or `dispatched`), or all of them; newest first.
+    pub fn review_prs(&self, open_only: bool) -> Result<Vec<ReviewPr>> {
+        let mut stmt = self.db.prepare(
+            "SELECT * FROM review_prs WHERE (?1 = 0 OR status IN ('new', 'dispatched')) \
+             ORDER BY offered_ts DESC, key",
+        )?;
+        let rows = stmt.query_map([open_only], review_pr_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn review_pr(&self, key: &str) -> Result<Option<ReviewPr>> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT * FROM review_prs WHERE key = ?1",
+                [key],
+                review_pr_row,
+            )
+            .optional()?)
+    }
+
+    /// Move a PR to a status, noting when; `agent` replaces the reviewer when given.
+    pub fn set_review_pr_status(&self, key: &str, status: &str, agent: Option<&str>) -> Result<()> {
+        self.db.execute(
+            "UPDATE review_prs SET status = ?2, decided_ts = ?3, agent = COALESCE(?4, agent) WHERE key = ?1",
+            params![key, status, now(), agent],
+        )?;
+        Ok(())
+    }
+
+    /// `set_review_pr_status`, but only for a row that's in one of the `from`
+    /// statuses. Returns how many rows changed.
+    pub fn set_review_pr_status_if(
+        &self,
+        key: &str,
+        from: &[&str],
+        to: &str,
+        agent: Option<&str>,
+    ) -> Result<usize> {
+        let mut changed = 0;
+        for status in from {
+            changed += self.db.execute(
+                "UPDATE review_prs SET status = ?3, decided_ts = ?4, agent = COALESCE(?5, agent) \
+                 WHERE key = ?1 AND status = ?2",
+                params![key, status, to, now(), agent],
+            )?;
+        }
+        Ok(changed)
+    }
+
+    pub fn update_review_pr_live(
+        &self,
+        key: &str,
+        pr_state: &str,
+        draft: bool,
+        ci: &str,
+        review_decision: &str,
+        my_review: &str,
+    ) -> Result<()> {
+        self.db.execute(
+            "UPDATE review_prs SET pr_state = ?2, draft = ?3, ci = ?4, review_decision = ?5, my_review = ?6, checked_ts = ?7 WHERE key = ?1",
+            params![key, pr_state, draft, ci, review_decision, my_review, now()],
+        )?;
+        Ok(())
+    }
+
+    /// A dismissed PR that's been posted again: back to `new`, with no
+    /// reviewer and no decision. Returns how many rows changed.
+    pub fn reoffer_review_pr(&self, key: &str) -> Result<usize> {
+        Ok(self.db.execute(
+            "UPDATE review_prs SET status = 'new', agent = '', offered_ts = ?2, decided_ts = 0 \
+             WHERE key = ?1 AND status = 'dismissed'",
+            params![key, now()],
+        )?)
+    }
+
+    /// Set the title and author from GitHub; an empty one leaves what's there.
+    pub fn update_review_pr_details(&self, key: &str, title: &str, author: &str) -> Result<()> {
+        self.db.execute(
+            "UPDATE review_prs SET title = COALESCE(NULLIF(?2, ''), title), author = COALESCE(NULLIF(?3, ''), author) WHERE key = ?1",
+            params![key, title, author],
+        )?;
+        Ok(())
+    }
+
+    /// Forget dismissed and closed PRs decided before `before`.
+    pub fn prune_review_prs(&self, before: f64) -> Result<()> {
+        self.db.execute(
+            "DELETE FROM review_prs WHERE status IN ('dismissed', 'closed') AND decided_ts < ?1",
+            [before],
+        )?;
+        Ok(())
     }
 
     pub fn mark_delivered(&self, id: i64) -> Result<()> {
@@ -754,6 +1235,261 @@ mod tests {
         st.mark_read("api", a).unwrap();
         assert!(st.queued("api").unwrap().is_empty());
         assert!(!st.unqueue("api", a).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn review_store(name: &str) -> (Store, std::path::PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("drovr-review-prs-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        (Store::open(&dir.join("t.db")).unwrap(), dir)
+    }
+
+    fn pr(n: i64) -> ReviewPr {
+        ReviewPr {
+            key: format!("https://github.com/acme/api/pull/{n}"),
+            url: format!("https://github.com/acme/api/pull/{n}"),
+            owner: "acme".into(),
+            repo: "api".into(),
+            number: n,
+            title: "T".into(),
+            author: "alice".into(),
+            source: "#c".into(),
+            status: "new".into(),
+            offered_ts: now(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn upserting_a_review_pr_keeps_its_status_and_agent() {
+        let (st, dir) = review_store("upsert");
+        st.upsert_review_pr(&pr(1)).unwrap();
+        st.set_review_pr_status(&pr(1).key, "dispatched", Some("rv-1"))
+            .unwrap();
+        let before = st.review_pr(&pr(1).key).unwrap().unwrap();
+        assert_eq!(
+            (before.status.as_str(), before.agent.as_str()),
+            ("dispatched", "rv-1")
+        );
+        assert!(before.decided_ts > 0.0);
+
+        let mut again = pr(1);
+        again.title = "Renamed".into();
+        again.source = "team acme/sre".into();
+        again.offered_ts = 1.0;
+        st.upsert_review_pr(&again).unwrap();
+        let after = st.review_pr(&pr(1).key).unwrap().unwrap();
+        assert_eq!(after.title, "Renamed");
+        assert_eq!(after.source, "team acme/sre");
+        assert_eq!(
+            (after.status.as_str(), after.agent.as_str()),
+            ("dispatched", "rv-1")
+        );
+        assert_eq!(after.offered_ts, before.offered_ts);
+        assert_eq!(after.decided_ts, before.decided_ts);
+        assert!(st.review_pr("nope").unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_open_review_prs_are_listed() {
+        let (st, dir) = review_store("open");
+        for n in 1..=4 {
+            st.upsert_review_pr(&pr(n)).unwrap();
+        }
+        st.set_review_pr_status(&pr(2).key, "dispatched", Some("a"))
+            .unwrap();
+        st.set_review_pr_status(&pr(3).key, "dismissed", None)
+            .unwrap();
+        st.set_review_pr_status(&pr(4).key, "closed", None).unwrap();
+        let keys = |open| {
+            st.review_prs(open)
+                .unwrap()
+                .into_iter()
+                .map(|p| p.number)
+                .collect::<Vec<_>>()
+        };
+        let mut open = keys(true);
+        open.sort();
+        assert_eq!(open, [1, 2]);
+        assert_eq!(keys(false).len(), 4);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn live_state_is_written_without_touching_the_status() {
+        let (st, dir) = review_store("live");
+        st.upsert_review_pr(&pr(1)).unwrap();
+        st.update_review_pr_live(&pr(1).key, "OPEN", true, "failure", "APPROVED", "COMMENTED")
+            .unwrap();
+        let p = st.review_pr(&pr(1).key).unwrap().unwrap();
+        assert_eq!(
+            (
+                p.pr_state.as_str(),
+                p.draft,
+                p.ci.as_str(),
+                p.review_decision.as_str(),
+                p.my_review.as_str()
+            ),
+            ("OPEN", true, "failure", "APPROVED", "COMMENTED")
+        );
+        assert!(p.checked_ts > 0.0);
+        assert_eq!(p.status, "new");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pruning_drops_only_old_decided_rows() {
+        let (st, dir) = review_store("prune");
+        for n in 1..=4 {
+            st.upsert_review_pr(&pr(n)).unwrap();
+        }
+        st.set_review_pr_status(&pr(2).key, "dismissed", None)
+            .unwrap();
+        st.set_review_pr_status(&pr(3).key, "closed", None).unwrap();
+        st.set_review_pr_status(&pr(4).key, "dispatched", Some("a"))
+            .unwrap();
+        // Nothing is older than a cutoff in the past.
+        st.prune_review_prs(now() - 1000.0).unwrap();
+        assert_eq!(st.review_prs(false).unwrap().len(), 4);
+        // Open rows are never pruned, however old.
+        st.prune_review_prs(now() + 1000.0).unwrap();
+        let left: Vec<i64> = st
+            .review_prs(false)
+            .unwrap()
+            .into_iter()
+            .map(|p| p.number)
+            .collect();
+        assert_eq!(left.len(), 2);
+        assert!(left.contains(&1) && left.contains(&4));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn guarded_transitions_only_move_matching_rows() {
+        let (st, dir) = review_store("guard");
+        st.upsert_review_pr(&pr(1)).unwrap();
+        let k = pr(1).key;
+        assert_eq!(
+            st.set_review_pr_status_if(&k, &["dispatched"], "closed", None)
+                .unwrap(),
+            0
+        );
+        assert_eq!(st.review_pr(&k).unwrap().unwrap().status, "new");
+        assert_eq!(
+            st.set_review_pr_status_if(&k, &["new"], "dispatched", None)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            st.set_review_pr_status_if(&k, &["new"], "dispatched", None)
+                .unwrap(),
+            0
+        );
+        let r = st.review_pr(&k).unwrap().unwrap();
+        assert_eq!((r.status.as_str(), r.agent.as_str()), ("dispatched", ""));
+        assert_eq!(
+            st.set_review_pr_status_if(&k, &["dispatched"], "dispatched", Some("rv"))
+                .unwrap(),
+            1
+        );
+        assert_eq!(st.review_pr(&k).unwrap().unwrap().agent, "rv");
+        assert_eq!(
+            st.set_review_pr_status_if(&k, &["new", "dispatched"], "closed", None)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            st.set_review_pr_status_if("nope", &["new"], "closed", None)
+                .unwrap(),
+            0
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unmovable_review_items_are_resolved_once() {
+        let (st, dir) = review_store("badmigrate");
+        let none = st
+            .add_item("drovr", "review", "R", "", &[], &serde_json::json!({}))
+            .unwrap();
+        let bad = st
+            .add_item(
+                "drovr",
+                "review",
+                "R",
+                "",
+                &[],
+                &serde_json::json!({"url": "https://example.com/x"}),
+            )
+            .unwrap();
+        let good = st
+            .add_item("drovr", "review", "R", "", &[], &serde_json::json!({"url": "https://github.com/Acme/Api/pull/5/files", "title": "t"}))
+            .unwrap();
+        drop(st);
+        let st = Store::open(&dir.join("t.db")).unwrap();
+        for id in [none, bad] {
+            let i = st.item(id).unwrap().unwrap();
+            assert_eq!(
+                (i.status.as_str(), i.answer.as_str()),
+                ("answered", "Couldn't move to PRs")
+            );
+        }
+        assert_eq!(st.item(good).unwrap().unwrap().answer, "Moved to PRs");
+        let rows = st.review_prs(false).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].url, "https://github.com/Acme/Api/pull/5");
+        assert_eq!(rows[0].key, "https://github.com/acme/api/pull/5");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pending_review_items_become_new_rows_on_open() {
+        let (st, dir) = review_store("migrate");
+        let payload = serde_json::json!({
+            "url": "https://github.com/Acme/Api/pull/5", "owner": "Acme", "repo": "Api",
+            "number": 5, "title": "Fix", "author": "alice", "source": "#sre"
+        });
+        let opts = ["Dispatch reviewer".to_string(), "Dismiss".to_string()];
+        let pending = st
+            .add_item("drovr", "review", "Review", "b", &opts, &payload)
+            .unwrap();
+        let answered = st
+            .add_item("drovr", "review", "Review", "b", &opts, &payload)
+            .unwrap();
+        st.resolve_item(answered, "answered", "Reviewer x started")
+            .unwrap();
+        let other = st
+            .add_item("a", "decision", "Q", "b", &[], &serde_json::json!({}))
+            .unwrap();
+        drop(st);
+
+        let st = Store::open(&dir.join("t.db")).unwrap();
+        let rows = st.review_prs(false).unwrap();
+        assert_eq!(rows.len(), 1);
+        let r = &rows[0];
+        assert_eq!(r.key, "https://github.com/acme/api/pull/5");
+        assert_eq!(r.status, "new");
+        assert_eq!(
+            (r.title.as_str(), r.author.as_str(), r.source.as_str()),
+            ("Fix", "alice", "#sre")
+        );
+        assert_eq!(r.number, 5);
+        let item = st.item(pending).unwrap().unwrap();
+        assert_eq!(
+            (item.status.as_str(), item.answer.as_str()),
+            ("answered", "Moved to PRs")
+        );
+        let item = st.item(answered).unwrap().unwrap();
+        assert_eq!(item.answer, "Reviewer x started");
+        assert_eq!(st.item(other).unwrap().unwrap().status, "pending");
+        drop(st);
+
+        // Opening again changes nothing.
+        let st = Store::open(&dir.join("t.db")).unwrap();
+        assert_eq!(st.review_prs(false).unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
